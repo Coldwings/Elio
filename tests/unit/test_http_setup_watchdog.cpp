@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <thread>
@@ -27,6 +28,7 @@ struct backend_guard {
 struct setup_probe {
     elio::sync::event hello_received;
     elio::sync::event release_start;
+    elio::sync::event release_arm;
     elio::coro::cancel_source recovery;
     std::atomic<bool> timer_failed{false};
     std::atomic<bool> peer_received{false};
@@ -36,6 +38,10 @@ struct setup_probe {
     std::atomic<bool> tls_entered{false};
     std::atomic<bool> connect_entered{false};
     std::atomic<bool> destruction_observed{false};
+    std::atomic<bool> before_arm{false};
+    std::mutex barrier_mutex;
+    bool barrier_released = false;
+    bool delay_arm = false;
     bool recovered = false;
     std::exception_ptr failure;
 };
@@ -66,10 +72,19 @@ void observe_destruction_wait() {
 }
 
 task<elio::coro::cancel_result> fail_ready_timer(
-        std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token token) {
     co_await elio::runtime::set_affinity(1);
-    elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
-    observed.load(std::memory_order_acquire)->timer_failed.store(true, std::memory_order_release);
+    auto& probe = *observed.load(std::memory_order_acquire);
+    if (probe.delay_arm) {
+        probe.before_arm.store(true, std::memory_order_release);
+        (void)co_await probe.release_arm.wait(std::move(token));
+    }
+    {
+        std::lock_guard lock(probe.barrier_mutex);
+        if (!probe.barrier_released)
+            elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
+        probe.timer_failed.store(true, std::memory_order_release);
+    }
     throw std::runtime_error("ready setup timer failed");
     co_return elio::coro::cancel_result::completed;
 }
@@ -88,7 +103,11 @@ struct ready_guard {
         elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
         elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
     }
-    static void release() noexcept {
+    void release() const noexcept {
+        std::lock_guard lock(probe.barrier_mutex);
+        // Release is terminal, including a controller observation timeout.
+        // A late hook must not park a worker after recovery has begun joining.
+        probe.barrier_released = true;
         elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
         elio::coro::detail::pause_before_detached_frame_destroy_for_test.notify_all();
     }
@@ -350,5 +369,46 @@ TEST_CASE("Connector joins an already-ready admitted watchdog before rethrowing"
     CHECK_FALSE(probe.connect_entered.load(std::memory_order_acquire));
     REQUIRE(probe.failure);
     try { std::rethrow_exception(probe.failure); }
+    catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "ready setup timer failed"); }
+}
+
+TEST_CASE("Released watchdog fixture barrier cannot be armed by a late timer",
+          "[http][setup][watchdog][setup-ready-late-arm][issue-1287]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    CAPTURE(static_cast<int>(selected));
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    backend_guard backend_scope(selected);
+    setup_probe probe;
+    probe.delay_arm = true;
+    timer_guard timer(probe);
+    elio::runtime::scheduler scheduler(2);
+    ready_guard ready(probe);
+    scheduler.start();
+    auto delayed = scheduler.go_joinable_to(1, fail_ready_timer(
+        std::chrono::steady_clock::now(), probe.recovery.get_token()));
+    const bool parked = observe([&] { return probe.before_arm.load(std::memory_order_acquire); });
+    std::exception_ptr control_failure;
+    ready.release();
+    try { probe.release_arm.set(); }
+    catch (...) { control_failure = std::current_exception(); }
+    probe.recovery.cancel();
+    delayed.wait_destroyed();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    std::exception_ptr timer_failure;
+    try { delayed.await_resume(); }
+    catch (...) { timer_failure = std::current_exception(); }
+    if (control_failure) std::rethrow_exception(control_failure);
+    REQUIRE(drained);
+    CHECK(parked);
+    CHECK(probe.timer_failed.load(std::memory_order_acquire));
+    CHECK_FALSE(elio::coro::detail::pause_before_detached_frame_destroy_for_test.load());
+    CHECK_FALSE(elio::coro::detail::detached_frame_destroy_paused_for_test.load());
+    REQUIRE(timer_failure);
+    try { std::rethrow_exception(timer_failure); }
     catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "ready setup timer failed"); }
 }

@@ -96,6 +96,7 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
     }
     bool allocation_failed = false;
     dispatch_hook_guard hook(fail_call);
+    if (!published) hook.release();
     try { signal.set(); }
     catch (const std::bad_alloc&) { allocation_failed = true; }
     hook.release();
@@ -119,7 +120,7 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
     for (auto& wait : waits) wait->await_resume();
     REQUIRE(drained);
     CHECK(published);
-    CHECK(allocation_failed == (fail_call == 0));
+    CHECK(allocation_failed == (published && fail_call == 0));
     if (allocation_failed) {
         CHECK_FALSE(signaled_after_attempt);
         CHECK(queued_after_attempt == waits.size());

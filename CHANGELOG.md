@@ -229,6 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Event signaling allocation safety**: `sync::event::set()` prepares all
+  dispatch storage before changing the signal or removing/claiming waiters.
+  Allocation failure now leaves pending waits recoverable by cancellation or
+  retry, rather than losing selected wakes. Successful signaling still dispatches
+  outside the event mutex; waiter/frame lifetime rules are unchanged (#1291).
+
 - **FD watchdog admission rejection**: observe an already-exceptional watchdog
   handle before invoking its sibling I/O factory, preventing accepted
   HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).

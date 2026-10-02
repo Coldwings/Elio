@@ -241,11 +241,21 @@ public:
         return cancellable_wait_awaitable(*this, std::move(token));
     }
 
-    /// Signal the event (wake all waiters)
+    /// Signal the event (wake all waiters). Dispatch-storage allocation can
+    /// throw before changing the signal or selecting any pending waiter.
     void set() {
         std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
+            // Prepare all dispatch storage before publishing the signal or
+            // claiming wakes. No throwing growth may lose selected waiters.
+            if (!waiters_.empty()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::event_dispatch_storage_for_test.load(std::memory_order_acquire))
+                    hook();
+#endif
+                to_schedule.reserve(waiters_.size());
+            }
             signaled_.store(true, std::memory_order_release);
 
             // Collect handles and pop from list under lock.
@@ -258,12 +268,6 @@ public:
                         continue;
                     }
                 }
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (to_schedule.size() == to_schedule.capacity()) {
-                    if (auto hook = detail::event_dispatch_storage_for_test.load(std::memory_order_acquire))
-                        hook();
-                }
-#endif
                 to_schedule.push_back(waiter->wake_state_);
             }
         }

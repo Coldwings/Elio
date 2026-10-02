@@ -392,10 +392,10 @@ private:
             plan.key().target_dns != detail::route_dns_mode::local)
             co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         const auto& snapshot = plan.snapshot();
-        co_return co_await client_connect_result(plan.target().host, plan.target().port,
+        co_return co_await detail::client_connect_result_impl(plan.target().host, plan.target().port,
             plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
             snapshot.rotate_resolved_addresses, connect_timeout, std::move(token),
-            snapshot.dns_timeout, snapshot.dns_domain, deadline);
+            snapshot.dns_timeout, snapshot.dns_domain, deadline, true);
     }
 
     struct pool_shard {
@@ -643,6 +643,10 @@ public:
         return true;
     }
     void finish_operation_for_test() noexcept { state_->finish_operation(); }
+    size_t active_operations_for_test() const {
+        std::lock_guard lock(state_->mutex);
+        return state_->active_operations;
+    }
     void signal_settled_for_test() { state_->settled.set(); }
     detail::route_plan route_plan_for_test(const url& target) const {
         return detail::route_plan(target, state_->snapshot);

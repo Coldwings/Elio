@@ -229,6 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP Transport TCP retirement**: private root sockets retain their immediate,
+  non-lingering local close policy across moves and setup exceptions. Plain HTTP
+  active discard, idle clearing and shutdown now close the descriptor before
+  releasing live capacity; asynchronous close submission is not settlement.
+  Ordinary standalone TCP teardown is unchanged (#1276).
+
 - **TCP preparation error reporting**: listener accept and outbound TCP connect
   preserve backend-published preparation errors through cleanup instead of
   replacing them with `EAGAIN`. The fallback remains `EAGAIN` when no negative

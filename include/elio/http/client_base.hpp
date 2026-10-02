@@ -261,19 +261,12 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
     }
 }
 
-/// Connect to a host with TLS context setup
-/// @param host Hostname
-/// @param port Port number
-/// @param secure If true, use TLS
-/// @param tls_ctx TLS context (required if secure)
-/// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
-/// @param dns_timeout Independent DNS observer timeout; <=0 disables
-/// @param dns_domain Shared DNS admission; null selects the default
-/// @param acquisition_deadline Optional absolute queue-inclusive budget supplied
-/// by the Transport. DNS/connect caps can shorten it, never restart or extend it.
-/// @return Connected stream or owned operational error; setup exceptions may throw.
+namespace detail {
+
+// Transport-created roots have no caller alias and retire only after borrowed
+// exchange operations settle. Keep this policy out of the public connector.
 inline coro::task<client_result<net::stream>>
-client_connect_result(std::string_view host, uint16_t port, bool secure,
+client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                tls::tls_context* tls_ctx,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
                bool rotate_resolved_addresses = true,
@@ -281,7 +274,8 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
                coro::cancel_token token = {},
                std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
                std::shared_ptr<net::resolve_domain> dns_domain = {},
-               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {}) {
+               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {},
+               bool settled_root = false) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
@@ -357,16 +351,6 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
             }));
     }
 
-    auto stop_watchdog = [&]() -> coro::task<void> {
-        timer_cancel_src->cancel();
-        if (watchdog) {
-            auto wd = std::move(*watchdog);
-            watchdog.reset();
-            co_await std::move(wd);
-        }
-        co_return;
-    };
-
     auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {
         if (timed_out->load(std::memory_order_acquire) ||
             (setup_deadline && *setup_deadline <= std::chrono::steady_clock::now())) {
@@ -380,75 +364,125 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
 
     auto last_error = detail::make_client_error(ECONNREFUSED, client_stage::connect);
 
-    if (secure) {
-        if (!tls_ctx) {
-            co_await stop_watchdog();
-            co_return detail::make_client_error(EINVAL, client_stage::tls);
-        }
+    auto connect_addresses = [&]() -> coro::task<client_result<net::stream>> {
+        if (secure) {
+            if (!tls_ctx) {
+                co_return detail::make_client_error(EINVAL, client_stage::tls);
+            }
 
-        for (size_t i = 0; i < addresses.size(); ++i) {
-            const auto& addr = addresses[(offset + i) % addresses.size()];
-            std::optional<net::tcp_stream> tcp;
-            tcp = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            const int tcp_error = tcp ? 0 : (errno ? errno : ECONNREFUSED);
-            if (auto error = stopped_error(client_stage::connect)) {
-                if (tcp) {
-                    tcp->shutdown_socket();
+            for (size_t i = 0; i < addresses.size(); ++i) {
+                const auto& addr = addresses[(offset + i) % addresses.size()];
+                std::optional<net::tcp_stream> tcp;
+                tcp = co_await net::detail::tcp_retirement_access::connect(
+                    addr, op_cancel_src->get_token(), settled_root);
+                const int tcp_error = tcp ? 0 : (errno ? errno : ECONNREFUSED);
+                if (auto error = stopped_error(client_stage::connect)) {
+                    if (tcp) {
+                        tcp->shutdown_socket();
+                    }
+                    co_return *error;
                 }
-                co_await stop_watchdog();
-                co_return *error;
-            }
-            if (!tcp) {
-                last_error = detail::make_client_error(tcp_error, client_stage::connect);
-                continue;
-            }
+                if (!tcp) {
+                    last_error = detail::make_client_error(tcp_error, client_stage::connect);
+                    continue;
+                }
 
-            tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
-            tls_stream.set_hostname(host);
+                tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
+                tls_stream.set_hostname(host);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-            if (auto hook = detail::tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
+                if (auto hook = detail::tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
 #endif
-            auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
-            const int tls_error = hs ? 0 : (errno ? errno : EIO);
-            if (auto error = stopped_error(client_stage::tls)) {
-                tls_stream.shutdown_socket();
-                co_await stop_watchdog();
-                co_return *error;
-            }
-            if (!hs) {
-                last_error = detail::make_client_error(tls_error, client_stage::tls);
-                continue;
-            }
-
-            co_await stop_watchdog();
-            co_return net::stream(std::move(tls_stream));
-        }
-
-        co_await stop_watchdog();
-        co_return last_error;
-    } else {
-        for (size_t i = 0; i < addresses.size(); ++i) {
-            const auto& addr = addresses[(offset + i) % addresses.size()];
-            std::optional<net::tcp_stream> result;
-            result = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            const int tcp_error = result ? 0 : (errno ? errno : ECONNREFUSED);
-            if (auto error = stopped_error(client_stage::connect)) {
-                if (result) {
-                    result->shutdown_socket();
+                auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
+                const int tls_error = hs ? 0 : (errno ? errno : EIO);
+                if (auto error = stopped_error(client_stage::tls)) {
+                    tls_stream.shutdown_socket();
+                    co_return *error;
                 }
-                co_await stop_watchdog();
-                co_return *error;
-            }
-            if (result) {
-                co_await stop_watchdog();
-                co_return net::stream(std::move(*result));
-            }
-            last_error = detail::make_client_error(tcp_error, client_stage::connect);
-        }
+                if (!hs) {
+                    last_error = detail::make_client_error(tls_error, client_stage::tls);
+                    continue;
+                }
 
-        co_await stop_watchdog();
-        co_return last_error;
+                co_return net::stream(std::move(tls_stream));
+            }
+
+            co_return last_error;
+        } else {
+            for (size_t i = 0; i < addresses.size(); ++i) {
+                const auto& addr = addresses[(offset + i) % addresses.size()];
+                std::optional<net::tcp_stream> result;
+                result = co_await net::detail::tcp_retirement_access::connect(
+                    addr, op_cancel_src->get_token(), settled_root);
+                const int tcp_error = result ? 0 : (errno ? errno : ECONNREFUSED);
+                if (auto error = stopped_error(client_stage::connect)) {
+                    if (result) {
+                        result->shutdown_socket();
+                    }
+                    co_return *error;
+                }
+                if (result) {
+                    co_return net::stream(std::move(*result));
+                }
+                last_error = detail::make_client_error(tcp_error, client_stage::connect);
+            }
+
+            co_return last_error;
+        }
+    };
+
+    std::optional<client_result<net::stream>> connected;
+    std::exception_ptr setup_failure;
+    try {
+        connected = co_await connect_addresses();
+    } catch (...) {
+        setup_failure = std::current_exception();
     }
+    // Stop the owned timer before allocating any cleanup frame, and preserve
+    // the first setup failure even if cancellation or watchdog retrieval throws.
+    try {
+        timer_cancel_src->cancel();
+    } catch (...) {
+        if (!setup_failure) setup_failure = std::current_exception();
+    }
+    if (watchdog) {
+        auto wd = std::move(*watchdog);
+        watchdog.reset();
+        try {
+            co_await std::move(wd);
+        } catch (...) {
+            if (!setup_failure) setup_failure = std::current_exception();
+        }
+    }
+    if (setup_failure) std::rethrow_exception(setup_failure);
+    co_return std::move(*connected);
+}
+
+} // namespace detail
+
+/// Connect to a host with TLS context setup
+/// @param host Hostname
+/// @param port Port number
+/// @param secure If true, use TLS
+/// @param tls_ctx TLS context (required if secure)
+/// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
+/// @param dns_timeout Independent DNS observer timeout; <=0 disables
+/// @param dns_domain Shared DNS admission; null selects the default
+/// @param acquisition_deadline Optional absolute queue-inclusive budget supplied
+/// by the Transport. DNS/connect caps can shorten it, never restart or extend it.
+/// @return Connected stream or owned operational error; setup exceptions may throw.
+inline coro::task<client_result<net::stream>>
+client_connect_result(std::string_view host, uint16_t port, bool secure,
+               tls::tls_context* tls_ctx,
+               net::resolve_options resolve_opts = net::default_cached_resolve_options(),
+               bool rotate_resolved_addresses = true,
+               std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
+               coro::cancel_token token = {},
+               std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
+               std::shared_ptr<net::resolve_domain> dns_domain = {},
+               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {}) {
+    return detail::client_connect_result_impl(host, port, secure, tls_ctx,
+        resolve_opts, rotate_resolved_addresses, connect_timeout, std::move(token),
+        dns_timeout, std::move(dns_domain), acquisition_deadline);
 }
 
 /// Compatibility wrapper; capture errno immediately on an empty result.

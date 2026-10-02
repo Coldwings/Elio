@@ -115,6 +115,10 @@ inline void* tagged_op_state_user_data(op_state* st) noexcept {
 
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> defer_destructor_close_submission_for_test{false};
+#endif
+
 /// Positive short submits mean the kernel consumed only part of the SQ ring.
 /// liburing keeps the unconsumed SQEs visible via io_uring_sq_ready(), so they
 /// must remain pending and be retried by the next submit/poll cycle.
@@ -719,6 +723,10 @@ public:
         // Submit immediately: the caller (a destructor) does not poll on its
         // own. Other workers will eventually drain the CQE; if no one ever
         // does, ``io_uring_queue_exit`` cleans up at backend teardown.
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::defer_destructor_close_submission_for_test.load(std::memory_order_acquire))
+            return true;
+#endif
         (void)io_uring_submit(&ring_);
         return true;
     }

@@ -229,6 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP response watchdog construction**: the owning watchdog frame is created
+  before admission and before sibling reads can suspend. Construction failure
+  and ready rejected admission now propagate without starting an unprotected
+  read; timer/fallback cleanup and the absolute response deadline are preserved
+  (#1283).
+
 - **Event signaling allocation safety**: `sync::event::set()` prepares all
   dispatch storage before changing the signal or removing/claiming waiters.
   Allocation failure now leaves pending waits recoverable by cancellation or

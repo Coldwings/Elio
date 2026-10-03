@@ -75,6 +75,8 @@ inline std::atomic<response_deadline_hook> response_deadline_for_test{nullptr};
 using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token, client_stage);
 inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> response_watchdog_before_start_for_test{nullptr};
+inline std::atomic<void (*)()> response_watchdog_operation_entered_for_test{nullptr};
 inline std::atomic<void(*)(int)> deferred_upload_for_test{nullptr};
 using deferred_upload_result_hook = coro::task<void> (*)(const std::optional<client_error>&);
 inline std::atomic<deferred_upload_result_hook> deferred_upload_result_for_test{nullptr};
@@ -1358,6 +1360,12 @@ private:
             auto read_completed = std::make_shared<std::atomic<bool>>(false);
             auto read_failed = std::make_shared<std::atomic<bool>>(false);
             coro::cancel_source watchdog_cancel;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::response_watchdog_before_start_for_test.load(
+                    std::memory_order_acquire)) {
+                co_await hook();
+            }
+#endif
             auto watchdog = scheduler_->go_joinable(
                 [this, deadline, expect_first, expired, read_cancel, read_completed, read_failed,
                  stage = response_read_stage(reader_.decoder()),
@@ -1417,9 +1425,28 @@ private:
                         std::rethrow_exception(failure);
                     }
                 });
+            // Graceful drain rejects this independent admission with an
+            // exceptional ready handle. Observe and destroy it before starting
+            // a response read that would otherwise have no timeout source.
+            if (watchdog.is_ready()) {
+                std::exception_ptr startup_failure;
+                try { watchdog.await_resume(); }
+                catch (...) { startup_failure = std::current_exception(); }
+                try { co_await watchdog.wait_destroyed_async(); }
+                catch (...) {
+                    if (!startup_failure) startup_failure = std::current_exception();
+                }
+                if (startup_failure) std::rethrow_exception(startup_failure);
+            }
             io::io_result result{};
             std::exception_ptr failure;
             try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::response_watchdog_operation_entered_for_test.load(
+                        std::memory_order_acquire)) {
+                    hook();
+                }
+#endif
                 result = co_await conn_.read(data, size, read_cancel->get_token());
             } catch (...) {
                 failure = std::current_exception();

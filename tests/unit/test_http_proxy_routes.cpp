@@ -287,6 +287,33 @@ task<void> serve_route(elio::net::tcp_listener& listener, bool secure,
     }
 }
 
+task<void> stall_tunnel_response(elio::net::tcp_listener& listener,
+        elio::tls::tls_context& tls_context, observed_route& observed,
+        elio::coro::cancel_token token) {
+    auto accepted = co_await accept_fixture_payload(listener, token,
+        &observed.empty_connections, &observed.accept_error);
+    if (!accepted) co_return;
+    ++observed.accepted;
+    auto stream = std::move(*accepted);
+    auto setup = co_await receive_request(stream, token, &observed.connect_read);
+    if (!setup) co_return;
+    observed.requests.push_back(std::move(*setup));
+    if ((co_await stream.write_exactly(
+            "HTTP/1.1 200 Tunnel\r\n\r\n", token)).result <= 0) co_return;
+    elio::tls::tls_stream origin(std::move(stream), tls_context);
+    observed.handshake = co_await origin.handshake(token);
+    if (!observed.handshake) {
+        observed.server_handshake_error = errno;
+        co_return;
+    }
+    auto incoming = co_await receive_request(origin, token);
+    if (!incoming) co_return;
+    observed.requests.push_back(std::move(*incoming));
+    elio::sync::event waiting;
+    (void)co_await waiting.wait(token);
+    co_await origin.abort_and_settle();
+}
+
 int record_sni(SSL* session, int*, void* context) noexcept {
     try {
         if (const auto* name = SSL_get_servername(session, TLSEXT_NAMETYPE_host_name))
@@ -433,6 +460,55 @@ public:
 private:
     std::atomic<bool> released_{false};
     elio::coro::detail::completion_waiter_slot slot_;
+};
+
+struct response_admission_observation {
+    route_test_phase release;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> operation_entered{false};
+};
+
+std::atomic<response_admission_observation*> response_admission_observed{nullptr};
+
+task<void> pause_before_response_watchdog_start() {
+    auto& observed = *response_admission_observed.load(std::memory_order_acquire);
+    observed.entered.store(true, std::memory_order_release);
+    co_await observed.release.wait();
+}
+
+void observe_response_operation_entry() {
+    response_admission_observed.load(std::memory_order_acquire)->operation_entered.store(
+        true, std::memory_order_release);
+}
+
+struct response_admission_guard {
+    response_admission_observation* previous_observation;
+    task<void> (*previous_start)();
+    void (*previous_operation)();
+    bool previous_read_observer;
+    bool previous_read_staged;
+    bool previous_admission_closed;
+    explicit response_admission_guard(response_admission_observation& observed)
+        : previous_observation(response_admission_observed.exchange(&observed))
+        , previous_start(detail::response_watchdog_before_start_for_test.exchange(
+              pause_before_response_watchdog_start))
+        , previous_operation(detail::response_watchdog_operation_entered_for_test.exchange(
+              observe_response_operation_entry))
+        , previous_read_observer(
+              detail::observe_client_response_read_entry_for_test.exchange(true))
+        , previous_read_staged(
+              detail::client_response_read_staged_for_test.exchange(false))
+        , previous_admission_closed(
+              elio::runtime::detail::graceful_admission_closed_for_test.exchange(false)) {}
+    ~response_admission_guard() {
+        response_admission_observed.store(previous_observation);
+        detail::response_watchdog_before_start_for_test.store(previous_start);
+        detail::response_watchdog_operation_entered_for_test.store(previous_operation);
+        detail::observe_client_response_read_entry_for_test.store(previous_read_observer);
+        detail::client_response_read_staged_for_test.store(previous_read_staged);
+        elio::runtime::detail::graceful_admission_closed_for_test.store(
+            previous_admission_closed);
+    }
 };
 
 struct route_ready_probe {
@@ -1653,6 +1729,95 @@ TEST_CASE("Route operation joins an already-ready admitted watchdog before rethr
     catch (const std::runtime_error& error) {
         CHECK(std::string_view(error.what()) == "ready route watchdog failed");
     }
+}
+
+TEST_CASE("Rejected response watchdog admission never starts a CONNECT tunnel read",
+          "[http][proxy][routes][watchdog][shutdown][issue-1249]") {
+    backend_guard backend_scope(backend::epoll);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    auto listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://127.0.0.1:" +
+        std::to_string(listener->local_address().port());
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("response admission trust setup failed");
+    };
+    auto owner = std::make_shared<transport>(config);
+    client_config request_policy;
+    request_policy.read_timeout = std::chrono::hours(1);
+    client agent(owner, request_policy);
+    observed_route observed;
+    response_admission_observation admission;
+    response_admission_guard hooks(admission);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto server = scheduler.go_joinable(stall_tunnel_response(
+        *listener, server_context, observed, stop.get_token()));
+    auto call = scheduler.go_joinable(agent.get_result("https://localhost/path"));
+
+    const bool entered = observe_route_ready([&] {
+        return admission.entered.load(std::memory_order_acquire);
+    });
+    bool shutdown_drained = false;
+    std::optional<std::thread> shutdown;
+    if (entered) {
+        shutdown.emplace([&] {
+            shutdown_drained = scheduler.shutdown(std::chrono::seconds(5));
+        });
+    }
+    const bool draining = entered && observe_route_ready([&] {
+        return elio::runtime::detail::graceful_admission_closed_for_test.load(
+            std::memory_order_acquire);
+    });
+    admission.release.set();
+    const bool outcome_observed = draining && observe_route_ready([&] {
+        return call.is_ready() ||
+            admission.operation_entered.load(std::memory_order_acquire);
+    });
+    const bool completed_before_recovery = outcome_observed && call.is_ready();
+    const bool operation_entered_before_recovery =
+        admission.operation_entered.load(std::memory_order_acquire);
+    const bool read_staged_before_recovery =
+        detail::client_response_read_staged_for_test.load(std::memory_order_acquire);
+
+    std::exception_ptr cleanup_failure;
+    try { stop.cancel(); }
+    catch (...) { cleanup_failure = std::current_exception(); }
+    server.wait_destroyed();
+    call.wait_destroyed();
+    if (shutdown) shutdown->join();
+    else shutdown_drained = scheduler.shutdown(std::chrono::seconds(5));
+
+    std::exception_ptr server_failure;
+    try { server.await_resume(); }
+    catch (...) { server_failure = std::current_exception(); }
+    std::string call_failure;
+    try { (void)call.await_resume(); }
+    catch (const std::exception& error) { call_failure = error.what(); }
+    catch (...) { call_failure = "non-standard exception"; }
+
+    if (cleanup_failure) std::rethrow_exception(cleanup_failure);
+    if (server_failure) std::rethrow_exception(server_failure);
+    REQUIRE(entered);
+    REQUIRE(draining);
+    REQUIRE(outcome_observed);
+    REQUIRE(completed_before_recovery);
+    CHECK_FALSE(operation_entered_before_recovery);
+    CHECK_FALSE(read_staged_before_recovery);
+    REQUIRE(shutdown_drained);
+    CHECK(call_failure == "scheduler rejected joinable task before execution");
+    CHECK(observed.handshake);
+    REQUIRE(observed.requests.size() == 2);
+    CHECK(observed.requests.front().get_method() == method::CONNECT);
+    CHECK(observed.requests.back().get_method() == method::GET);
+    CHECK(owner->active_operations_for_test() == 0);
 }
 
 TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cancellation",

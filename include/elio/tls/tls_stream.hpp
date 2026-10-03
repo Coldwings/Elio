@@ -38,7 +38,7 @@
 
 namespace elio::tls {
 
-namespace detail { struct tls_idle_access; }
+namespace detail { struct tls_idle_access; struct tls_retirement_access; }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
@@ -128,6 +128,7 @@ template<typename Lower = net::tcp_stream>
 requires detail::tls_lower_stream<Lower>
 class basic_tls_stream {
     friend struct detail::tls_idle_access;
+    friend struct detail::tls_retirement_access;
 public:
     using byte_stream_contract = net::publishing_byte_stream_contract;
 
@@ -1331,11 +1332,42 @@ private:
 
 namespace detail {
 
+// Internal owner binding before a Transport publishes or drives the session.
+// The release event represents physical-root destruction, not pump inactivity.
+struct tls_retirement_access {
+    template<typename Lower>
+    static std::shared_ptr<tls_root_release_state> bind(basic_tls_stream<Lower>& stream,
+                                           std::shared_ptr<void> owner) {
+        if constexpr (std::same_as<Lower, net::tcp_stream>)
+            net::detail::tcp_retirement_access::mark_settled_root(stream.transport_->lower);
+        {
+            auto lock = stream.lock_ssl_state();
+            if (stream.transport_->retirement) {
+                assert(stream.transport_->retirement->owner == owner);
+                return stream.transport_->retirement->released;
+            }
+        }
+        auto retirement = std::make_shared<tls_root_retirement>();
+        retirement->owner = std::move(owner);
+        auto released = retirement->released;
+        auto lock = stream.lock_ssl_state();
+        stream.transport_->retirement = std::move(retirement);
+        return released;
+    }
+};
+
 // Internal pooling snapshot, not a general concurrent-operation guarantee.
 // The caller has already settled its public TLS operations and holds exclusive
 // session ownership. Any remaining transport reference can still retain an
 // output/lower frame even after its drained watermark has been reported.
 struct tls_idle_access {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    template<typename Lower>
+    static int queue_plaintext_for_test(
+            basic_tls_stream<Lower>& stream, const void* data, size_t size) {
+        return stream.call_write(data, size).ret;
+    }
+#endif
     template<typename Lower>
     static bool is_quiescent(const basic_tls_stream<Lower>& stream) noexcept {
         if (!stream.transport_) return false;

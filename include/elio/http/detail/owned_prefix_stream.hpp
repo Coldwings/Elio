@@ -125,6 +125,9 @@ public:
 
     owned_prefix_stream(Lower lower, std::vector<char> prefix, size_t prefix_limit,
                         std::shared_ptr<void> retirement = {}) {
+        if constexpr (std::same_as<Lower, net::tcp_stream>) {
+            if (retirement) net::detail::tcp_retirement_access::mark_settled_root(lower);
+        }
         if (prefix.size() > prefix_limit)
             throw std::invalid_argument("HTTP CONNECT read-ahead exceeds its bound");
         owner_ = std::make_shared<state>(std::move(lower), std::move(prefix), std::move(retirement));

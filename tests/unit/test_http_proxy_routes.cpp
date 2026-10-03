@@ -2323,6 +2323,1235 @@ TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 an
     if (finite) CHECK(owner->admission_counters_for_test().live == 0);
 }
 
+namespace {
+struct direct_output_observation {
+    output_observation output;
+    int fd = -1;
+    std::atomic<bool> client_tls_created{false};
+    std::atomic<bool> client_tls_ready{false};
+    std::atomic<bool> client_tls_failed{false};
+    std::atomic<bool> server_accept_entered{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<size_t> server_empty_connections{0};
+    std::atomic<bool> server_handshake_entered{false};
+    std::atomic<bool> server_handshake_finished{false};
+    std::atomic<bool> server_handshake_ok{false};
+    std::atomic<int> server_handshake_error{0};
+    std::atomic<bool> server_request_entered{false};
+    std::atomic<bool> server_request_received{false};
+    elio::sync::event handshake_failed;
+    std::atomic<int> handshake_error{0};
+    std::atomic<long> verification{X509_V_OK};
+};
+
+struct observe_root_close {
+    int fd;
+    bool& destroyed;
+    bool& closed;
+    ~observe_root_close() {
+        destroyed = true;
+        closed = ::fcntl(fd, F_GETFD) < 0 && errno == EBADF;
+    }
+};
+
+#if ELIO_HAS_IO_URING
+struct deferred_close_submission {
+    bool previous = elio::io::detail::defer_destructor_close_submission_for_test.exchange(true);
+    ~deferred_close_submission() {
+        elio::io::detail::defer_destructor_close_submission_for_test.store(previous);
+    }
+};
+#endif
+
+} // namespace
+
+TEST_CASE("Owned Transport roots close before releasing their accounting owner",
+          "[http][tls][retirement][issue-1272][root-close]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto direct = GENERATE(false, true);
+    backend_guard backend_selection(selected);
+#if ELIO_HAS_IO_URING
+    deferred_close_submission defer_close;
+#endif
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    bool created = false;
+    bool destroyed = false;
+    bool closed = false;
+    auto retire = [&]() -> task<void> {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) co_return;
+        created = true;
+        auto owner = std::make_shared<observe_root_close>(fd, destroyed, closed);
+        if (direct) {
+            elio::tls::tls_stream stream(elio::net::tcp_stream(fd), context);
+            (void)elio::tls::detail::tls_retirement_access::bind(stream, owner);
+            owner.reset();
+        } else {
+            detail::owned_prefix_stream<elio::net::tcp_stream> stream(
+                elio::net::tcp_stream(fd), {}, 8192, owner);
+            owner.reset();
+        }
+    };
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto retired = scheduler.go_joinable(retire());
+    retired.wait_destroyed();
+    retired.await_resume();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    CHECK(created);
+    CHECK(destroyed);
+    CHECK(closed);
+}
+
+TEST_CASE("Settled root close survives moves and exclusive setup failure",
+          "[http][tls][retirement][issue-1272][root-close]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto phase = GENERATE(0, 1, 2);
+    backend_guard backend_selection(selected);
+#if ELIO_HAS_IO_URING
+    deferred_close_submission defer_close;
+#endif
+    bool created = false;
+    bool destroyed = false;
+    bool closed = false;
+    bool setup_failed = false;
+    bool linger_disabled = false;
+    auto retire = [&]() -> task<void> {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) co_return;
+        created = true;
+        auto owner = std::make_shared<observe_root_close>(fd, destroyed, closed);
+        try {
+            elio::net::tcp_stream original(fd);
+            elio::net::detail::fail_root_linger_configuration_for_test.store(phase == 1);
+            elio::net::detail::tcp_retirement_access::mark_settled_root(original);
+            ::linger option{};
+            socklen_t length = sizeof(option);
+            linger_disabled = ::getsockopt(fd, SOL_SOCKET, SO_LINGER, &option, &length) == 0 &&
+                option.l_onoff == 0;
+            if (phase == 2) {
+                detail::owned_prefix_stream<elio::net::tcp_stream> invalid(
+                    std::move(original), {'x'}, 0, owner);
+            } else {
+                elio::net::tcp_stream moved(std::move(original));
+                elio::net::tcp_stream assigned(-1);
+                assigned = std::move(moved);
+            }
+        } catch (const std::system_error& error) {
+            setup_failed = error.code().value() == ENOMEM;
+        } catch (const std::invalid_argument&) {
+            setup_failed = true;
+        }
+        elio::net::detail::fail_root_linger_configuration_for_test.store(false);
+        owner.reset();
+    };
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto retired = scheduler.go_joinable(retire());
+    retired.wait_destroyed();
+    retired.await_resume();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    CHECK(created);
+    CHECK(destroyed);
+    CHECK(closed);
+    CHECK(setup_failed == (phase != 0));
+    if (phase != 1) CHECK(linger_disabled);
+}
+
+TEST_CASE("TLS root retirement notifies its preallocated observer without wake allocation",
+          "[http][tls][retirement][issue-1272]") {
+    const auto phase = GENERATE(0, 1, 2);
+    auto retirement = std::make_shared<elio::tls::detail::tls_root_retirement>();
+    const auto released = retirement->released;
+    static_assert(noexcept(released->set()));
+    const auto allocations = elio::sync::detail::wake_state_allocations_for_test.load();
+    if (phase == 2) {
+        auto wait = released->wait();
+        CHECK_FALSE(wait.await_ready());
+        retirement.reset();
+        CHECK_FALSE(wait.await_suspend(std::noop_coroutine()));
+        wait.await_resume();
+    } else {
+        if (phase == 0) retirement.reset();
+        size_t completed = 0;
+        auto observe = [&]() -> task<void> {
+            co_await released->wait();
+            ++completed;
+        };
+        auto waiting = observe();
+        auto frame = elio::coro::detail::task_access::handle(waiting);
+        frame.resume();
+        const bool suspended = !frame.done();
+        elio::sync::detail::fail_next_wake_state_allocation_for_test.store(true);
+        retirement.reset();
+        const bool allocation_unused =
+            elio::sync::detail::fail_next_wake_state_allocation_for_test.exchange(false);
+        REQUIRE(frame.done());
+        waiting.await_resume();
+        CHECK(completed == 1);
+        CHECK(suspended == (phase == 1));
+        CHECK(allocation_unused);
+    }
+    CHECK(elio::sync::detail::wake_state_allocations_for_test.load() == allocations);
+}
+
+namespace {
+
+std::atomic<direct_output_observation*> direct_output_observed{nullptr};
+
+struct direct_phase_diagnostics {
+    bool captured = false;
+    bool client_tls_created = false;
+    bool client_tls_ready = false;
+    bool client_tls_failed = false;
+    int client_handshake_error = 0;
+    long client_verification = X509_V_OK;
+    bool server_accept_entered = false;
+    bool server_accepted = false;
+    size_t server_empty_connections = 0;
+    bool server_handshake_entered = false;
+    bool server_handshake_finished = false;
+    bool server_handshake_ok = false;
+    int server_handshake_error = 0;
+    bool server_request_entered = false;
+    bool server_request_received = false;
+};
+
+void capture_direct_phases(void* context) noexcept {
+    auto& phases = *static_cast<direct_phase_diagnostics*>(context);
+    auto* observed = direct_output_observed.load(std::memory_order_acquire);
+    if (!observed) return;
+    phases.captured = true;
+    phases.client_tls_created = observed->client_tls_created.load(std::memory_order_acquire);
+    phases.client_tls_ready = observed->client_tls_ready.load(std::memory_order_acquire);
+    phases.client_tls_failed = observed->client_tls_failed.load(std::memory_order_acquire);
+    phases.client_handshake_error = observed->handshake_error.load(std::memory_order_acquire);
+    phases.client_verification = observed->verification.load(std::memory_order_acquire);
+    phases.server_accept_entered = observed->server_accept_entered.load(std::memory_order_acquire);
+    phases.server_accepted = observed->server_accepted.load(std::memory_order_acquire);
+    phases.server_empty_connections =
+        observed->server_empty_connections.load(std::memory_order_acquire);
+    phases.server_handshake_entered =
+        observed->server_handshake_entered.load(std::memory_order_acquire);
+    phases.server_handshake_finished =
+        observed->server_handshake_finished.load(std::memory_order_acquire);
+    phases.server_handshake_ok = observed->server_handshake_ok.load(std::memory_order_acquire);
+    phases.server_handshake_error =
+        observed->server_handshake_error.load(std::memory_order_acquire);
+    phases.server_request_entered = observed->server_request_entered.load(std::memory_order_acquire);
+    phases.server_request_received =
+        observed->server_request_received.load(std::memory_order_acquire);
+}
+
+ssize_t defer_direct_output_send(void*, int, const void*, size_t, int) {
+    errno = EAGAIN;
+    return -1;
+}
+
+void observe_direct_created(elio::tls::tls_stream&) {
+    direct_output_observed.load(std::memory_order_acquire)->client_tls_created.store(
+        true, std::memory_order_release);
+}
+
+void install_direct_output_hooks(elio::tls::tls_stream& stream) {
+    auto& observed = *direct_output_observed.load();
+    observed.fd = stream.fd();
+    observed.output.handshake_bytes = stream.finish_state_for_test().accepted_ciphertext;
+    stream.set_output_test_hooks({nullptr, defer_direct_output_send, nullptr});
+    stream.set_output_progress_test_hook(&observed.output,
+        observed.output.hold_inactive ? nullptr : pause_drained_output,
+        observed.output.hold_inactive ? pause_drained_output : nullptr);
+}
+
+void observe_direct_created_with_output(elio::tls::tls_stream& stream) {
+    observe_direct_created(stream);
+    install_direct_output_hooks(stream);
+}
+
+void observe_direct_output(elio::tls::tls_stream& stream) {
+    auto& observed = *direct_output_observed.load();
+    observed.client_tls_created.store(true, std::memory_order_release);
+    observed.client_tls_ready.store(true, std::memory_order_release);
+    install_direct_output_hooks(stream);
+}
+
+void observe_direct_failure(elio::tls::tls_stream& stream, int error) {
+    auto& observed = *direct_output_observed.load();
+    observed.client_tls_failed.store(true, std::memory_order_release);
+    observed.handshake_error.store(error, std::memory_order_release);
+    observed.verification.store(stream.verify_result(), std::memory_order_release);
+    observed.handshake_failed.set();
+}
+
+struct direct_output_hooks {
+    explicit direct_output_hooks(direct_output_observation& observed, bool before_handshake = false) {
+        direct_output_observed.store(&observed);
+        if (before_handshake) {
+            detail::client_tls_created_for_test.store(observe_direct_created_with_output);
+            detail::client_tls_failed_for_test.store(observe_direct_failure);
+        } else {
+            detail::client_tls_created_for_test.store(observe_direct_created);
+            detail::client_tls_ready_for_test.store(observe_direct_output);
+            detail::client_tls_failed_for_test.store(observe_direct_failure);
+        }
+    }
+    ~direct_output_hooks() {
+        detail::client_tls_ready_for_test.store(nullptr);
+        detail::client_tls_created_for_test.store(nullptr);
+        detail::client_tls_failed_for_test.store(nullptr);
+        direct_output_observed.store(nullptr);
+    }
+};
+
+struct completed_setup_watchdog_observation {
+    direct_output_observation direct;
+    elio::sync::event watchdog_failed;
+    elio::sync::event cleanup_entered;
+    elio::coro::cancel_source watchdog_recovery;
+    int queued_plaintext = 0;
+};
+
+std::atomic<completed_setup_watchdog_observation*>
+    completed_setup_watchdog_observed{nullptr};
+
+void observe_completed_tls_setup(elio::tls::tls_stream& stream) {
+    auto& observed = *completed_setup_watchdog_observed.load(
+        std::memory_order_acquire);
+    install_direct_output_hooks(stream);
+    constexpr char marker = 'x';
+    observed.queued_plaintext =
+        elio::tls::detail::tls_idle_access::queue_plaintext_for_test(
+            stream, &marker, sizeof(marker));
+}
+
+void observe_completed_setup_cleanup() {
+    completed_setup_watchdog_observed.load(
+        std::memory_order_acquire)->cleanup_entered.set();
+}
+
+task<elio::coro::cancel_result> fail_completed_setup_watchdog(
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+    auto& observed = *completed_setup_watchdog_observed.load(
+        std::memory_order_acquire);
+    if (co_await observed.direct.output.paused.wait(
+            observed.watchdog_recovery.get_token()) !=
+            elio::coro::cancel_result::completed)
+        co_return elio::coro::cancel_result::cancelled;
+    observed.watchdog_failed.set();
+    throw std::runtime_error("injected completed setup watchdog failure");
+    co_return elio::coro::cancel_result::completed;
+}
+
+void recover_completed_setup_watchdog(void* context) noexcept {
+    try {
+        static_cast<completed_setup_watchdog_observation*>(context)->
+            watchdog_recovery.cancel();
+    } catch (...) {}
+}
+
+struct completed_setup_watchdog_hooks {
+    detail::setup_watchdog_wait_hook previous_wait;
+    void (*previous_connected)(elio::tls::tls_stream&);
+    void (*previous_failed)(elio::tls::tls_stream&, int);
+    void (*previous_cleanup)();
+    direct_output_observation* previous_output;
+    completed_setup_watchdog_observation* previous_observation;
+
+    explicit completed_setup_watchdog_hooks(
+            completed_setup_watchdog_observation& observed)
+        : previous_wait(detail::setup_watchdog_wait_for_test.exchange(
+              fail_completed_setup_watchdog))
+        , previous_connected(detail::client_tls_connected_for_test.exchange(
+              observe_completed_tls_setup))
+        , previous_failed(detail::client_tls_failed_for_test.exchange(
+              observe_direct_failure))
+        , previous_cleanup(detail::setup_tls_cleanup_entered_for_test.exchange(
+              observe_completed_setup_cleanup))
+        , previous_output(direct_output_observed.exchange(&observed.direct))
+        , previous_observation(completed_setup_watchdog_observed.exchange(&observed)) {}
+
+    ~completed_setup_watchdog_hooks() {
+        completed_setup_watchdog_observed.store(previous_observation);
+        direct_output_observed.store(previous_output);
+        detail::setup_tls_cleanup_entered_for_test.store(previous_cleanup);
+        detail::client_tls_failed_for_test.store(previous_failed);
+        detail::client_tls_connected_for_test.store(previous_connected);
+        detail::setup_watchdog_wait_for_test.store(previous_wait);
+    }
+};
+
+struct direct_retry_observation {
+    direct_output_observation first;
+    uint16_t first_port = 0;
+    uint16_t second_port = 0;
+    std::atomic<size_t> dns_calls{0};
+    std::atomic<size_t> dials{0};
+    std::atomic<size_t> tls_sessions{0};
+    std::atomic<bool> root_released{false};
+    std::atomic<bool> first_closed_at_release{false};
+    std::atomic<bool> second_dial_after_release{false};
+    elio::sync::event waiting_for_root;
+    elio::sync::event second_dial;
+};
+
+std::atomic<direct_retry_observation*> direct_retry_observed{nullptr};
+
+elio::net::detail::dns_lookup_result resolve_direct_retry(
+        std::string_view, uint16_t) {
+    auto& observed = *direct_retry_observed.load(std::memory_order_acquire);
+    observed.dns_calls.fetch_add(1, std::memory_order_relaxed);
+    elio::net::detail::dns_lookup_result result;
+    result.cacheable = false;
+    result.addresses.emplace_back(elio::net::ipv4_address("127.0.0.1", observed.first_port));
+    result.addresses.emplace_back(elio::net::ipv4_address("127.0.0.1", observed.second_port));
+    return result;
+}
+
+void observe_direct_retry(
+        detail::direct_tls_retry_step step, size_t) {
+    auto& observed = *direct_retry_observed.load(std::memory_order_acquire);
+    if (step == detail::direct_tls_retry_step::dialing) {
+        const auto dial = observed.dials.fetch_add(1, std::memory_order_acq_rel);
+        if (dial == 1) {
+            observed.second_dial_after_release.store(
+                observed.root_released.load(std::memory_order_acquire) &&
+                observed.first_closed_at_release.load(std::memory_order_acquire),
+                std::memory_order_release);
+            observed.second_dial.set();
+        }
+    } else if (step == detail::direct_tls_retry_step::waiting_for_root) {
+        observed.waiting_for_root.set();
+    } else {
+        errno = 0;
+        observed.first_closed_at_release.store(
+            ::fcntl(observed.first.fd, F_GETFD) < 0 && errno == EBADF,
+            std::memory_order_release);
+        observed.root_released.store(true, std::memory_order_release);
+    }
+}
+
+void observe_direct_retry_created(elio::tls::tls_stream& stream) {
+    auto& observed = *direct_retry_observed.load(std::memory_order_acquire);
+    const auto session = observed.tls_sessions.fetch_add(1, std::memory_order_acq_rel);
+    if (session == 0) {
+        observed.first.client_tls_created.store(true, std::memory_order_release);
+        install_direct_output_hooks(stream);
+    }
+}
+
+void observe_direct_retry_failure(elio::tls::tls_stream& stream, int error) {
+    auto& observed = *direct_retry_observed.load(std::memory_order_acquire);
+    if (observed.tls_sessions.load(std::memory_order_acquire) == 1)
+        observe_direct_failure(stream, error);
+}
+
+struct direct_retry_hooks {
+    explicit direct_retry_hooks(direct_retry_observation& observed) {
+        direct_retry_observed.store(&observed, std::memory_order_release);
+        direct_output_observed.store(&observed.first, std::memory_order_release);
+        elio::net::detail::owned_dns_lookup_for_test.store(
+            resolve_direct_retry, std::memory_order_release);
+        detail::direct_tls_retry_for_test.store(observe_direct_retry, std::memory_order_release);
+        detail::client_tls_created_for_test.store(
+            observe_direct_retry_created, std::memory_order_release);
+        detail::client_tls_failed_for_test.store(
+            observe_direct_retry_failure, std::memory_order_release);
+    }
+    ~direct_retry_hooks() {
+        detail::client_tls_failed_for_test.store(nullptr, std::memory_order_release);
+        detail::client_tls_created_for_test.store(nullptr, std::memory_order_release);
+        detail::direct_tls_retry_for_test.store(nullptr, std::memory_order_release);
+        elio::net::detail::owned_dns_lookup_for_test.store(nullptr, std::memory_order_release);
+        direct_output_observed.store(nullptr, std::memory_order_release);
+        direct_retry_observed.store(nullptr, std::memory_order_release);
+    }
+};
+
+void finish_fixture_output(output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure, bool cancel = false) noexcept {
+    try { output.release.set(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    if (cancel || failure) {
+        try { stop.cancel(); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+}
+
+template<typename T>
+task<bool> await_fixture_ready(elio::coro::join_handle<T>& joined,
+        output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure, void* recovery_context = nullptr,
+        void (*before_recovery)(void*) noexcept = nullptr) {
+    // Bound diagnostic waits as well as public I/O. An early operational error
+    // may never reach the retained-output hook; cancellation still joins every
+    // frame, and releasing the hook also unblocks terminal output settlement.
+    try {
+        const auto outcome = co_await joined.wait_until(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10));
+        if (outcome == elio::coro::join_wait_outcome::completed) co_return true;
+    } catch (...) { if (!failure) failure = std::current_exception(); }
+    if (before_recovery) before_recovery(recovery_context);
+    finish_fixture_output(output, stop, failure, true);
+    co_return false;
+}
+
+template<typename T>
+task<T> await_fixture_result(elio::coro::join_handle<T>& joined,
+        output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure, void* recovery_context = nullptr,
+        void (*before_recovery)(void*) noexcept = nullptr) {
+    std::optional<T> result;
+    try { result.emplace(co_await joined); }
+    catch (...) {
+        if (!failure) failure = std::current_exception();
+        if (before_recovery) before_recovery(recovery_context);
+        finish_fixture_output(output, stop, failure, true);
+    }
+    try { co_await joined.wait_destroyed_async(); }
+    catch (...) {
+        if (!failure) failure = std::current_exception();
+        if (before_recovery) before_recovery(recovery_context);
+        finish_fixture_output(output, stop, failure, true);
+    }
+    // The caller rethrows the preserved exception only after all siblings join.
+    co_return result ? std::move(*result) : T{};
+}
+
+task<bool> await_fixture_phase(elio::sync::event& phase,
+        output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure, void* recovery_context = nullptr,
+        void (*before_recovery)(void*) noexcept = nullptr) {
+    auto* scheduler = elio::runtime::scheduler::current();
+    std::optional<elio::coro::join_handle<elio::coro::cancel_result>> waiting;
+    try {
+        waiting.emplace(scheduler->go_joinable([&]() -> task<elio::coro::cancel_result> {
+            co_return co_await phase.wait(stop.get_token());
+        }));
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+        if (before_recovery) before_recovery(recovery_context);
+        finish_fixture_output(output, stop, failure, true);
+        co_return false;
+    }
+    bool reached = false;
+    auto result = elio::coro::cancel_result::cancelled;
+    try {
+        reached = co_await await_fixture_ready(*waiting, output, stop, failure,
+            recovery_context, before_recovery);
+        result = co_await await_fixture_result(*waiting, output, stop, failure,
+            recovery_context, before_recovery);
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+        if (before_recovery) before_recovery(recovery_context);
+        finish_fixture_output(output, stop, failure, true);
+    }
+    try { co_await waiting->wait_destroyed_async(); }
+    catch (...) {
+        if (!failure) failure = std::current_exception();
+        if (before_recovery) before_recovery(recovery_context);
+        finish_fixture_output(output, stop, failure, true);
+    }
+    co_return reached && result == elio::coro::cancel_result::completed;
+}
+
+task<void> serve_direct_output(elio::net::tcp_listener& listener,
+        elio::tls::tls_context& context, direct_output_observation& observed,
+        elio::coro::cancel_token token) {
+    observed.server_accept_entered.store(true, std::memory_order_release);
+    size_t empty_connections = 0;
+    auto accepted = co_await accept_fixture_payload(
+        listener, token, &empty_connections);
+    observed.server_empty_connections.store(
+        empty_connections, std::memory_order_release);
+    if (!accepted) co_return;
+    observed.server_accepted.store(true, std::memory_order_release);
+    elio::tls::tls_stream stream(std::move(*accepted), context);
+    observed.server_handshake_entered.store(true, std::memory_order_release);
+    const bool handshake_ok = co_await stream.handshake(token);
+    const int handshake_error = handshake_ok ? 0 : errno;
+    observed.server_handshake_error.store(handshake_error, std::memory_order_release);
+    observed.server_handshake_ok.store(handshake_ok, std::memory_order_release);
+    observed.server_handshake_finished.store(true, std::memory_order_release);
+    if (handshake_ok) {
+        observed.server_request_entered.store(true, std::memory_order_release);
+        if (co_await receive_request(stream, token)) {
+            observed.server_request_received.store(true, std::memory_order_release);
+            (void)co_await stream.write_exactly(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", token);
+            std::array<char, 1> bytes{};
+            (void)co_await stream.read(bytes.data(), bytes.size(), token);
+        }
+    }
+    co_await stream.abort_and_settle();
+}
+
+task<elio::coro::cancel_result> throw_fixture_observer(
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+    throw std::runtime_error("injected retirement observer failure");
+    co_return elio::coro::cancel_result::cancelled;
+}
+
+struct fixture_observer_hook {
+    elio::coro::detail::join_timer_wait_hook previous;
+    explicit fixture_observer_hook(bool enabled)
+        : previous(elio::coro::detail::join_timer_wait_for_test.exchange(
+              enabled ? throw_fixture_observer : nullptr)) {}
+    ~fixture_observer_hook() {
+        elio::coro::detail::join_timer_wait_for_test.store(previous);
+    }
+};
+
+struct fixture_frame_probe {
+    bool& destroyed;
+    ~fixture_frame_probe() { destroyed = true; }
+};
+
+void count_fixture_recovery(void* context) noexcept {
+    ++*static_cast<size_t*>(context);
+}
+} // namespace
+
+TEST_CASE("Retirement fixtures release and join held frames before reporting exceptions",
+          "[http][tls][retirement][issue-1272][fixture-exception]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto observer_failure = GENERATE(false, true);
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    backend_guard backend_scope(selected);
+    fixture_observer_hook hook(observer_failure);
+    output_observation output;
+    elio::sync::event missing_phase;
+    bool held_completed = false;
+    bool held_destroyed = false;
+    bool throwing_destroyed = observer_failure;
+    bool cancelled = false;
+    size_t recovery_calls = 0;
+    std::exception_ptr failure;
+    elio::runtime::scheduler scheduler(workers);
+    scheduler.start();
+    auto controlled = scheduler.go_joinable([&]() -> task<void> {
+        elio::coro::cancel_source stop;
+        auto held = scheduler.go_joinable([&]() -> task<void> {
+            fixture_frame_probe frame{held_destroyed};
+            co_await output.release.wait();
+            held_completed = true;
+        });
+        if (observer_failure) {
+            (void)co_await await_fixture_phase(missing_phase, output, stop, failure,
+                &recovery_calls, count_fixture_recovery);
+        } else {
+            auto throwing = scheduler.go_joinable([&]() -> task<int> {
+                fixture_frame_probe frame{throwing_destroyed};
+                throw std::runtime_error("injected retirement request failure");
+                co_return 0;
+            });
+            (void)co_await await_fixture_result(throwing, output, stop, failure,
+                &recovery_calls, count_fixture_recovery);
+        }
+        cancelled = stop.is_cancelled();
+        co_await held;
+        co_await held.wait_destroyed_async();
+    });
+    controlled.wait_destroyed();
+    controlled.await_resume();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    CHECK(held_completed);
+    CHECK(held_destroyed);
+    CHECK(throwing_destroyed);
+    CHECK(cancelled);
+    CHECK(recovery_calls > 0);
+    REQUIRE(failure);
+    try { std::rethrow_exception(failure); }
+    catch (const std::runtime_error& error) {
+        CHECK(std::string_view(error.what()) == (observer_failure
+            ? "injected retirement observer failure" : "injected retirement request failure"));
+    }
+}
+
+TEST_CASE("Direct HTTPS Transport retains root accounting through late owned output frames",
+          "[http][tls][retirement][issue-1272]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto finite = GENERATE(false, true);
+    const auto inactive = GENERATE(false, true);
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    CAPTURE(selected, finite, inactive, workers);
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    empty_connection_probe probe;
+    REQUIRE(probe.fd >= 0);
+    const auto direct_address = elio::net::ipv4_address(
+        "127.0.0.1", listener->local_address().port()).to_sockaddr();
+    REQUIRE(::connect(probe.fd, reinterpret_cast<const sockaddr*>(&direct_address),
+                      sizeof(direct_address)) == 0);
+    REQUIRE(::shutdown(probe.fd, SHUT_WR) == 0);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    transport_config config;
+    config.acquisition_timeout = std::chrono::seconds(5);
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("direct retirement trust loading failed");
+    };
+    if (finite) config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    const auto target = "https://localhost:" + std::to_string(listener->local_address().port()) + "/path";
+    direct_output_observation observed;
+    observed.output.hold_inactive = inactive;
+    direct_output_hooks hooks(observed);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(workers);
+    scheduler.start();
+    auto server = scheduler.go_joinable(
+        serve_direct_output(*listener, server_context, observed, stop.get_token()));
+    struct retirement_snapshot {
+        size_t operations = 0;
+        size_t idle = 0;
+        size_t live = 0;
+        bool fd_open = false;
+        bool shutdown_ready = false;
+        bool fd_closed = false;
+        bool pause_reached = false;
+        bool request_completed = false;
+        direct_phase_diagnostics phases;
+        std::exception_ptr failure;
+        elio::coro::cancel_result shutdown_result = elio::coro::cancel_result::cancelled;
+    } snapshot;
+    auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        elio::coro::cancel_source call_stop;
+        std::optional<elio::coro::join_handle<client_result<response>>> call;
+        std::optional<elio::coro::join_handle<elio::coro::cancel_result>> shutdown;
+        client_result<response> result;
+        elio::sync::event entered;
+        try {
+            call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
+            snapshot.pause_reached = co_await await_fixture_phase(
+                observed.output.paused, observed.output, call_stop, snapshot.failure,
+                &snapshot.phases, capture_direct_phases);
+            snapshot.request_completed = co_await await_fixture_ready(
+                *call, observed.output, call_stop, snapshot.failure);
+            result = co_await await_fixture_result(*call, observed.output, call_stop, snapshot.failure);
+            snapshot.operations = owner->active_operations_for_test();
+            if (finite) snapshot.idle = owner->admission_counters_for_test().idle;
+            shutdown.emplace(scheduler.go_joinable([&]() -> task<elio::coro::cancel_result> {
+                entered.set();
+                co_return co_await owner->shutdown();
+            }));
+            (void)co_await await_fixture_phase(entered, observed.output, call_stop, snapshot.failure);
+            snapshot.fd_open = ::fcntl(observed.fd, F_GETFD) >= 0;
+            snapshot.shutdown_ready = shutdown->is_ready();
+            if (finite) snapshot.live = owner->admission_counters_for_test().live;
+            finish_fixture_output(observed.output, call_stop, snapshot.failure);
+            snapshot.shutdown_result = co_await await_fixture_result(
+                *shutdown, observed.output, call_stop, snapshot.failure);
+        } catch (...) {
+            if (!snapshot.failure) snapshot.failure = std::current_exception();
+            finish_fixture_output(observed.output, call_stop, snapshot.failure, true);
+        }
+        if (!snapshot.phases.captured) capture_direct_phases(&snapshot.phases);
+        if (call) co_await call->wait_destroyed_async();
+        if (shutdown) co_await shutdown->wait_destroyed_async();
+        snapshot.fd_closed = ::fcntl(observed.fd, F_GETFD) == -1;
+        co_return result;
+    });
+    controlled.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    const auto result = controlled.await_resume();
+    server.await_resume();
+    if (snapshot.failure) std::rethrow_exception(snapshot.failure);
+    CAPTURE(snapshot.phases.client_tls_created, snapshot.phases.client_tls_ready,
+        snapshot.phases.client_tls_failed, snapshot.phases.client_handshake_error,
+        snapshot.phases.client_verification, snapshot.phases.server_accept_entered,
+        snapshot.phases.server_accepted, snapshot.phases.server_empty_connections,
+        snapshot.phases.server_handshake_entered,
+        snapshot.phases.server_handshake_finished, snapshot.phases.server_handshake_ok,
+        snapshot.phases.server_handshake_error, snapshot.phases.server_request_entered,
+        snapshot.phases.server_request_received);
+    if (const auto* error = std::get_if<client_error>(&result)) {
+        CAPTURE(error->code.value(), error->stage);
+        CHECK_FALSE(error);
+    }
+    CHECK(snapshot.pause_reached);
+    CHECK(snapshot.request_completed);
+    CHECK(snapshot.phases.server_empty_connections == 1);
+    CHECK(snapshot.operations == 1);
+    if (finite) CHECK(snapshot.idle == 0);
+    CHECK(snapshot.fd_open);
+    CHECK_FALSE(snapshot.shutdown_ready);
+    if (finite) CHECK(snapshot.live == 1);
+    CHECK(snapshot.shutdown_result == elio::coro::cancel_result::completed);
+    CHECK(snapshot.fd_closed);
+    REQUIRE(std::holds_alternative<response>(result));
+    CHECK(std::get<response>(result).body() == "ok");
+    CHECK(owner->active_operations_for_test() == 0);
+    if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Failed direct TLS setup retains accounting until its late output root is destroyed",
+          "[http][tls][retirement][setup-failure][issue-1272]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto finite = GENERATE(false, true);
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    CAPTURE(selected, finite, workers);
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    transport_config config;
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("failed direct setup trust loading failed");
+    };
+    if (finite) config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::seconds::zero();
+    client agent(owner, policy);
+    const auto target = "https://127.0.0.1:" +
+        std::to_string(listener->local_address().port()) + "/path";
+    direct_output_observation observed;
+    observed.output.hold_inactive = true;
+    direct_output_hooks hooks(observed, true);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(workers);
+    scheduler.start();
+    auto server = scheduler.go_joinable(
+        serve_direct_output(*listener, server_context, observed, stop.get_token()));
+    struct failure_snapshot {
+        size_t operations = 0;
+        size_t live = 0;
+        bool fd_open = false;
+        bool fd_closed = false;
+        bool request_ready = false;
+        bool pause_reached = false;
+        bool failure_observed = false;
+        std::exception_ptr failure;
+        elio::coro::cancel_result shutdown_result = elio::coro::cancel_result::cancelled;
+    } snapshot;
+    auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        elio::coro::cancel_source call_stop;
+        std::optional<elio::coro::join_handle<client_result<response>>> call;
+        std::optional<elio::coro::join_handle<elio::coro::cancel_result>> shutdown;
+        client_result<response> result;
+        try {
+            call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
+            snapshot.pause_reached = co_await await_fixture_phase(
+                observed.output.paused, observed.output, call_stop, snapshot.failure);
+            snapshot.failure_observed = co_await await_fixture_phase(
+                observed.handshake_failed, observed.output, call_stop, snapshot.failure);
+            snapshot.operations = owner->active_operations_for_test();
+            if (finite) snapshot.live = owner->admission_counters_for_test().live;
+            snapshot.fd_open = ::fcntl(observed.fd, F_GETFD) >= 0;
+            snapshot.request_ready = call->is_ready();
+            shutdown.emplace(scheduler.go_joinable(owner->shutdown()));
+            finish_fixture_output(observed.output, call_stop, snapshot.failure);
+            result = co_await await_fixture_result(*call, observed.output, call_stop, snapshot.failure);
+            snapshot.shutdown_result = co_await await_fixture_result(
+                *shutdown, observed.output, call_stop, snapshot.failure);
+        } catch (...) {
+            if (!snapshot.failure) snapshot.failure = std::current_exception();
+            finish_fixture_output(observed.output, call_stop, snapshot.failure, true);
+        }
+        if (call) co_await call->wait_destroyed_async();
+        if (shutdown) co_await shutdown->wait_destroyed_async();
+        snapshot.fd_closed = ::fcntl(observed.fd, F_GETFD) == -1;
+        co_return result;
+    });
+    controlled.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    const auto result = controlled.await_resume();
+    server.await_resume();
+    if (snapshot.failure) std::rethrow_exception(snapshot.failure);
+    CHECK(snapshot.pause_reached);
+    CHECK(snapshot.failure_observed);
+    CHECK(snapshot.operations == 1);
+    if (finite) CHECK(snapshot.live == 1);
+    CHECK(snapshot.fd_open);
+    CHECK_FALSE(snapshot.request_ready);
+    CHECK(snapshot.shutdown_result == elio::coro::cancel_result::completed);
+    CHECK(snapshot.fd_closed);
+    const auto* error = std::get_if<client_error>(&result);
+    REQUIRE(error);
+    CHECK(error->stage == client_stage::tls);
+    CHECK(error->code.value() > 0);
+    CHECK(error->code.value() != ETIMEDOUT);
+    CHECK(error->code.value() != ECANCELED);
+    CHECK(observed.verification == X509_V_ERR_IP_ADDRESS_MISMATCH);
+    CHECK(observed.handshake_error > 0);
+    CHECK(owner->active_operations_for_test() == 0);
+    if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Completed setup watchdog fixture recovers after an early direct TLS failure",
+          "[http][tls][retirement][fixture-recovery][issue-1272]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
+                                  elio::tls::tls_version::tls_1_3);
+    CAPTURE(selected, version);
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server, version);
+    temporary_pem ca;
+    install_certificate(server_context, ca, "DNS:localhost");
+    transport_config config;
+    config.limits = pool_limits{};
+    config.limits->max_live_total = 1;
+    config.limits->max_live_per_route = 1;
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("watchdog recovery trust loading failed");
+    };
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::seconds(30);
+    client agent(owner, policy);
+    const auto target = "https://127.0.0.1:" +
+        std::to_string(listener->local_address().port()) + "/path";
+    completed_setup_watchdog_observation observed;
+    completed_setup_watchdog_hooks hooks(observed);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_direct_output(
+        *listener, server_context, observed.direct, stop.get_token()));
+    struct recovery_snapshot {
+        bool handshake_failed = false;
+        bool request_ready_before_recovery = true;
+        bool recovery_sent = false;
+        std::exception_ptr failure;
+        elio::coro::cancel_result shutdown_result =
+            elio::coro::cancel_result::cancelled;
+    } snapshot;
+    auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        elio::coro::cancel_source fixture_stop;
+        std::optional<elio::coro::join_handle<client_result<response>>> call;
+        client_result<response> result;
+        try {
+            call.emplace(scheduler.go_joinable(
+                agent.get_result(target, fixture_stop.get_token())));
+            snapshot.handshake_failed = co_await await_fixture_phase(
+                observed.direct.handshake_failed, observed.direct.output,
+                fixture_stop, snapshot.failure, &observed,
+                recover_completed_setup_watchdog);
+            snapshot.request_ready_before_recovery = call->is_ready();
+            recover_completed_setup_watchdog(&observed);
+            snapshot.recovery_sent = true;
+            result = co_await await_fixture_result(
+                *call, observed.direct.output, fixture_stop, snapshot.failure);
+            snapshot.shutdown_result = co_await owner->shutdown();
+        } catch (...) {
+            if (!snapshot.failure) snapshot.failure = std::current_exception();
+            recover_completed_setup_watchdog(&observed);
+            finish_fixture_output(
+                observed.direct.output, fixture_stop, snapshot.failure, true);
+        }
+        if (call) co_await call->wait_destroyed_async();
+        co_return result;
+    });
+    controlled.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    const auto result = controlled.await_resume();
+    server.await_resume();
+    if (snapshot.failure) std::rethrow_exception(snapshot.failure);
+    CHECK(snapshot.handshake_failed);
+    CHECK_FALSE(snapshot.request_ready_before_recovery);
+    CHECK(snapshot.recovery_sent);
+    CHECK_FALSE(observed.watchdog_failed.is_set());
+    CHECK(observed.direct.client_tls_failed.load(std::memory_order_acquire));
+    CHECK(observed.direct.verification.load(std::memory_order_acquire) ==
+          X509_V_ERR_IP_ADDRESS_MISMATCH);
+    const auto* error = std::get_if<client_error>(&result);
+    REQUIRE(error);
+    CHECK(error->stage == client_stage::tls);
+    CHECK(error->code.value() > 0);
+    CHECK(snapshot.shutdown_result == elio::coro::cancel_result::completed);
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
+          "[http][tls][retirement][setup-watchdog-failure][issue-1272]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
+                                  elio::tls::tls_version::tls_1_3);
+    const auto inactive = GENERATE(false, true);
+    CAPTURE(selected, version, inactive);
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server, version);
+    temporary_pem ca;
+    install_certificate(server_context, ca, "DNS:localhost");
+    transport_config config;
+    config.limits = pool_limits{};
+    config.limits->max_live_total = 1;
+    config.limits->max_live_per_route = 1;
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("completed setup watchdog trust loading failed");
+    };
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::seconds(30);
+    client agent(owner, policy);
+    const auto target = "https://localhost:" +
+        std::to_string(listener->local_address().port()) + "/path";
+    completed_setup_watchdog_observation observed;
+    observed.direct.output.hold_inactive = inactive;
+    completed_setup_watchdog_hooks hooks(observed);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_direct_output(
+        *listener, server_context, observed.direct, stop.get_token()));
+    struct failure_snapshot {
+        size_t operations = 0;
+        size_t live = 0;
+        bool output_paused = false;
+        bool watchdog_failed = false;
+        bool cleanup_entered = false;
+        bool fd_open = false;
+        bool fd_closed = false;
+        bool request_ready = false;
+        bool shutdown_ready = false;
+        bool request_returned = false;
+        bool watchdog_exception = false;
+        size_t operations_after_exception = 1;
+        size_t live_after_exception = 1;
+        bool fd_closed_on_exception = false;
+        std::exception_ptr failure;
+        elio::coro::cancel_result shutdown_result =
+            elio::coro::cancel_result::cancelled;
+    } snapshot;
+    auto controlled = scheduler.go_joinable([&]() -> task<void> {
+        elio::coro::cancel_source fixture_stop;
+        std::optional<elio::coro::join_handle<client_result<response>>> call;
+        std::optional<elio::coro::join_handle<elio::coro::cancel_result>> shutdown;
+        try {
+            call.emplace(scheduler.go_joinable(
+                agent.get_result(target, fixture_stop.get_token())));
+            snapshot.output_paused = co_await await_fixture_phase(
+                observed.direct.output.paused, observed.direct.output,
+                fixture_stop, snapshot.failure, &observed,
+                recover_completed_setup_watchdog);
+            snapshot.watchdog_failed = snapshot.output_paused &&
+                co_await await_fixture_phase(
+                    observed.watchdog_failed, observed.direct.output,
+                    fixture_stop, snapshot.failure, &observed,
+                    recover_completed_setup_watchdog);
+            snapshot.cleanup_entered = snapshot.watchdog_failed &&
+                co_await await_fixture_phase(
+                    observed.cleanup_entered, observed.direct.output,
+                    fixture_stop, snapshot.failure, &observed,
+                    recover_completed_setup_watchdog);
+            snapshot.operations = owner->active_operations_for_test();
+            snapshot.live = owner->admission_counters_for_test().live;
+            snapshot.fd_open = ::fcntl(observed.direct.fd, F_GETFD) >= 0;
+            snapshot.request_ready = call->is_ready();
+            shutdown.emplace(scheduler.go_joinable(owner->shutdown()));
+            snapshot.shutdown_ready = shutdown->is_ready();
+            finish_fixture_output(
+                observed.direct.output, fixture_stop, snapshot.failure);
+            try {
+                auto& joined = *call;
+                (void)co_await joined;
+                snapshot.request_returned = true;
+            } catch (const std::runtime_error& error) {
+                snapshot.watchdog_exception = std::string_view(error.what()) ==
+                    "injected completed setup watchdog failure";
+                if (!snapshot.watchdog_exception)
+                    snapshot.failure = std::current_exception();
+            } catch (...) {
+                snapshot.failure = std::current_exception();
+            }
+            snapshot.operations_after_exception = owner->active_operations_for_test();
+            snapshot.live_after_exception = owner->admission_counters_for_test().live;
+            snapshot.fd_closed_on_exception =
+                ::fcntl(observed.direct.fd, F_GETFD) == -1;
+            try { co_await call->wait_destroyed_async(); }
+            catch (...) { if (!snapshot.failure) snapshot.failure = std::current_exception(); }
+            snapshot.shutdown_result = co_await await_fixture_result(
+                *shutdown, observed.direct.output, fixture_stop, snapshot.failure);
+        } catch (...) {
+            if (!snapshot.failure) snapshot.failure = std::current_exception();
+            recover_completed_setup_watchdog(&observed);
+            finish_fixture_output(
+                observed.direct.output, fixture_stop, snapshot.failure, true);
+        }
+        if (call) co_await call->wait_destroyed_async();
+        if (shutdown) co_await shutdown->wait_destroyed_async();
+        snapshot.fd_closed = ::fcntl(observed.direct.fd, F_GETFD) == -1;
+    });
+    controlled.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    controlled.await_resume();
+    server.await_resume();
+    if (snapshot.failure) std::rethrow_exception(snapshot.failure);
+    CHECK(snapshot.output_paused);
+    CHECK(observed.queued_plaintext == 1);
+    CHECK(snapshot.watchdog_failed);
+    CHECK(snapshot.cleanup_entered);
+    CHECK(snapshot.operations == 1);
+    CHECK(snapshot.live == 1);
+    CHECK(snapshot.fd_open);
+    CHECK_FALSE(snapshot.request_ready);
+    CHECK_FALSE(snapshot.shutdown_ready);
+    CHECK_FALSE(snapshot.request_returned);
+    CHECK(snapshot.watchdog_exception);
+    CHECK(snapshot.operations_after_exception == 0);
+    CHECK(snapshot.live_after_exception == 0);
+    CHECK(snapshot.fd_closed_on_exception);
+    CHECK(snapshot.shutdown_result == elio::coro::cancel_result::completed);
+    CHECK(snapshot.fd_closed);
+    CHECK(observed.direct.server_accepted.load(std::memory_order_acquire));
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Direct TLS retry waits for the failed physical root to close",
+          "[http][tls][retirement][retry][issue-1272]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    CAPTURE(selected);
+    backend_guard backend_scope(selected);
+    auto first_listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    auto second_listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(first_listener);
+    REQUIRE(second_listener);
+    elio::tls::tls_context first_context(elio::tls::tls_mode::server);
+    elio::tls::tls_context second_context(elio::tls::tls_mode::server);
+    temporary_pem first_ca;
+    temporary_pem second_ca;
+    install_certificate(first_context, first_ca, "DNS:not-retry.elio.test");
+    install_certificate(second_context, second_ca, "DNS:retry.elio.test");
+    transport_config config;
+    config.resolve_options.use_cache = false;
+    config.rotate_resolved_addresses = false;
+    config.limits = pool_limits{};
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(first_ca.path.data()) ||
+            !policy.load_verify_locations(second_ca.path.data()))
+            throw std::runtime_error("direct retry trust loading failed");
+    };
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::seconds::zero();
+    client agent(owner, policy);
+    direct_retry_observation observed;
+    observed.first_port = first_listener->local_address().port();
+    observed.second_port = second_listener->local_address().port();
+    observed.first.output.hold_inactive = true;
+    direct_output_observation second_observed;
+    direct_retry_hooks hooks(observed);
+    const std::string target = "https://retry.elio.test:" +
+        std::to_string(observed.first_port) + "/path";
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto first_server = scheduler.go_joinable(serve_direct_output(
+        *first_listener, first_context, observed.first, stop.get_token()));
+    auto second_server = scheduler.go_joinable(serve_direct_output(
+        *second_listener, second_context, second_observed, stop.get_token()));
+    struct retry_snapshot {
+        bool pause_reached = false;
+        bool failure_observed = false;
+        bool root_wait_observed = false;
+        bool second_dial_observed = false;
+        bool root_released_before_barrier = false;
+        bool first_open_before_barrier = false;
+        bool request_ready_before_barrier = false;
+        size_t dials_before_barrier = 0;
+        size_t tls_sessions_before_barrier = 0;
+        bool request_completed_after_second_dial = false;
+        std::exception_ptr failure;
+        elio::coro::cancel_result shutdown_result = elio::coro::cancel_result::cancelled;
+    } snapshot;
+    auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        elio::coro::cancel_source call_stop;
+        std::optional<elio::coro::join_handle<client_result<response>>> call;
+        client_result<response> result;
+        try {
+            call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
+            snapshot.pause_reached = co_await await_fixture_phase(
+                observed.first.output.paused, observed.first.output, call_stop, snapshot.failure);
+            snapshot.failure_observed = co_await await_fixture_phase(
+                observed.first.handshake_failed, observed.first.output,
+                call_stop, snapshot.failure);
+            snapshot.root_wait_observed = co_await await_fixture_phase(
+                observed.waiting_for_root, observed.first.output, call_stop, snapshot.failure);
+            snapshot.dials_before_barrier = observed.dials.load(std::memory_order_acquire);
+            snapshot.tls_sessions_before_barrier =
+                observed.tls_sessions.load(std::memory_order_acquire);
+            snapshot.root_released_before_barrier =
+                observed.root_released.load(std::memory_order_acquire);
+            snapshot.first_open_before_barrier = ::fcntl(observed.first.fd, F_GETFD) >= 0;
+            snapshot.request_ready_before_barrier = call->is_ready();
+            finish_fixture_output(observed.first.output, call_stop, snapshot.failure);
+            snapshot.second_dial_observed = co_await await_fixture_phase(
+                observed.second_dial, observed.first.output, call_stop, snapshot.failure);
+            snapshot.request_completed_after_second_dial = co_await await_fixture_ready(
+                *call, observed.first.output, call_stop, snapshot.failure);
+            result = co_await await_fixture_result(
+                *call, observed.first.output, call_stop, snapshot.failure);
+            snapshot.shutdown_result = co_await owner->shutdown();
+        } catch (...) {
+            if (!snapshot.failure) snapshot.failure = std::current_exception();
+            finish_fixture_output(observed.first.output, call_stop, snapshot.failure, true);
+        }
+        if (call) co_await call->wait_destroyed_async();
+        co_return result;
+    });
+    controlled.wait_destroyed();
+    stop.cancel();
+    first_server.wait_destroyed();
+    second_server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    const auto result = controlled.await_resume();
+    first_server.await_resume();
+    second_server.await_resume();
+    if (snapshot.failure) std::rethrow_exception(snapshot.failure);
+    CHECK(snapshot.pause_reached);
+    CHECK(snapshot.failure_observed);
+    CHECK(snapshot.root_wait_observed);
+    CHECK(snapshot.dials_before_barrier == 1);
+    CHECK(snapshot.tls_sessions_before_barrier == 1);
+    CHECK_FALSE(snapshot.root_released_before_barrier);
+    CHECK(snapshot.first_open_before_barrier);
+    CHECK_FALSE(snapshot.request_ready_before_barrier);
+    CHECK(snapshot.second_dial_observed);
+    CHECK(snapshot.request_completed_after_second_dial);
+    CHECK(observed.dns_calls.load(std::memory_order_acquire) == 1);
+    CHECK(observed.dials.load(std::memory_order_acquire) == 2);
+    CHECK(observed.tls_sessions.load(std::memory_order_acquire) == 2);
+    CHECK(observed.root_released.load(std::memory_order_acquire));
+    CHECK(observed.first_closed_at_release.load(std::memory_order_acquire));
+    CHECK(observed.second_dial_after_release.load(std::memory_order_acquire));
+    CHECK(snapshot.shutdown_result == elio::coro::cancel_result::completed);
+    CHECK(observed.first.verification == X509_V_ERR_HOSTNAME_MISMATCH);
+    CHECK(observed.first.handshake_error > 0);
+    CHECK_FALSE(observed.first.server_handshake_ok.load(std::memory_order_acquire));
+    CHECK(second_observed.server_handshake_ok.load(std::memory_order_acquire));
+    REQUIRE(std::holds_alternative<response>(result));
+    CHECK(std::get<response>(result).body() == "ok");
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
+
 TEST_CASE("CONNECT retirement holds physical capacity until the owned lower frame releases",
           "[http][proxy][routes][capacity][issue-1249]") {
     using namespace elio::http::detail;

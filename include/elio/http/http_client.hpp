@@ -580,7 +580,7 @@ private:
         void return_reusable() {
             if (disposition_ != disposition::active) return;
             // HTTP framing does not settle TLS control/output work. Retire a
-            // tunnel whose owned transport still has a pump/lower frame.
+            // TLS route whose owned transport still has a pump/lower frame.
             if (!conn_.io_quiescent()) {
                 retire();
                 return;
@@ -861,12 +861,19 @@ private:
             plan.key().target_dns != detail::route_dns_mode::local)
             co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         const auto& snapshot = plan.snapshot();
+        std::shared_ptr<detail::route_retirement> retirement;
+        if (plan.key().target_secure) {
+            retirement = std::make_shared<detail::route_retirement>();
+            retirement->operation = operation;
+            retirement->capacity = std::move(capacity);
+        }
         auto result = co_await detail::client_connect_result_impl(plan.target().host, plan.target().port,
             plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
             snapshot.rotate_resolved_addresses, timeout, token,
-            snapshot.dns_timeout, snapshot.dns_domain, deadline, true);
+            snapshot.dns_timeout, snapshot.dns_domain, deadline, true, nullptr, retirement);
         if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
-        co_return detail::route_connection(std::move(std::get<connection>(result)));
+        if (retirement) capacity = std::move(retirement->capacity);
+        co_return detail::route_connection(std::move(std::get<connection>(result)), std::move(retirement));
     }
 
     const std::shared_ptr<state> state_;

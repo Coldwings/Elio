@@ -22,7 +22,13 @@ struct route_retirement;
 class route_connection {
 public:
     route_connection() = default;
-    explicit route_connection(net::stream stream) noexcept : stream_(std::move(stream)) {}
+    explicit route_connection(net::stream stream,
+            std::shared_ptr<route_retirement> retirement = {})
+        : retirement_(std::move(retirement)), stream_(std::move(stream)) {
+        auto& legacy = std::get<net::stream>(stream_);
+        if (retirement_ && legacy.is_tls())
+            tls::detail::tls_retirement_access::bind(legacy.as_tls(), retirement_);
+    }
     explicit route_connection(connect_tls_stream stream,
             std::shared_ptr<route_retirement> retirement = {}) noexcept
         : retirement_(std::move(retirement)), stream_(std::move(stream)) {}
@@ -104,7 +110,10 @@ public:
 
     bool io_quiescent() const noexcept {
         const auto* tunnel = std::get_if<connect_tls_stream>(&stream_);
-        return !tunnel || tls::detail::tls_idle_access::is_quiescent(*tunnel);
+        if (tunnel) return tls::detail::tls_idle_access::is_quiescent(*tunnel);
+        const auto* legacy = std::get_if<net::stream>(&stream_);
+        return !legacy || !legacy->is_tls() ||
+            tls::detail::tls_idle_access::is_quiescent(legacy->as_tls());
     }
 
     int fd() const noexcept {

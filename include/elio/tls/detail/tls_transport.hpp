@@ -3,7 +3,9 @@
 #include "output_bio.hpp"
 #include "../../net/tcp.hpp"
 #include "../../sync/mutex.hpp"
+#include "../../sync/event.hpp"
 #include "../../sync/detail/wake_state.hpp"
+#include "../../coro/detail/completion_waiter.hpp"
 #include "../../runtime/scheduler.hpp"
 
 #include <openssl/bio.h>
@@ -21,6 +23,53 @@
 #include <type_traits>
 
 namespace elio::tls::detail {
+
+// A failed connector has one serialized physical-root observer. Reserve its
+// completion slot before driving TLS; notification bookkeeping does not allocate,
+// and abandoning an unclaimed wake cannot retain a stale handle. Scheduling the
+// selected coroutine still uses the runtime's ordinary dispatch storage.
+class tls_root_release_state : public std::enable_shared_from_this<tls_root_release_state> {
+    class awaitable {
+    public:
+        explicit awaitable(std::shared_ptr<tls_root_release_state> owner) noexcept
+            : owner_(std::move(owner)), waiter_(owner_->slot_) {}
+        bool await_ready() const noexcept { return owner_->released_.load(std::memory_order_acquire); }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            auto owner = owner_;
+            return owner->slot_.register_waiter(waiter_, handle, [owner] {
+                return owner->released_.load(std::memory_order_acquire);
+            });
+        }
+        void await_resume() const noexcept {
+            assert(owner_->released_.load(std::memory_order_acquire));
+        }
+
+    private:
+        std::shared_ptr<tls_root_release_state> owner_;
+        coro::detail::completion_waiter waiter_;
+    };
+
+public:
+    auto wait() noexcept { return awaitable(shared_from_this()); }
+    void set() noexcept {
+        released_.store(true, std::memory_order_release);
+        auto selected = slot_.take();
+        if (auto handle = selected.claim()) runtime::schedule_handle(handle);
+    }
+
+private:
+    std::atomic<bool> released_{false};
+    coro::detail::completion_waiter_slot slot_;
+};
+
+struct tls_root_retirement {
+    std::shared_ptr<void> owner;
+    std::shared_ptr<tls_root_release_state> released = std::make_shared<tls_root_release_state>();
+    ~tls_root_retirement() {
+        owner.reset();
+        released->set();
+    }
+};
 
 // Owns ciphertext and the lower stream, never SSL or caller plaintext. The TLS
 // owner must call fail() on abandonment: an active pump deliberately retains
@@ -109,6 +158,8 @@ public:
     basic_tls_transport(Lower stream, size_t budget, int direct_output_fd = -1)
         : lower(std::move(stream)), output(direct_output_fd, budget) {}
 
+    // Destroy the physical lower before releasing its caller's accounting.
+    std::shared_ptr<tls_root_retirement> retirement;
     Lower lower;
     output_bio_state output;
     BIO* input = nullptr;

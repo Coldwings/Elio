@@ -186,10 +186,18 @@ and disconnecting the stream. Destruction never marks an unfinished response
 reusable, drains a body, or starts hidden asynchronous TLS shutdown. Allocation
 exceptions during pool insertion still leave the lease responsible for
 retirement. There is no public unchecked reuse flag or escaping lease API.
-CONNECT tunnels are conservatively retired when TLS output or an owned lower
+Direct HTTPS and CONNECT tunnels are conservatively retired when TLS output or an owned lower
 frame remains after HTTP completion; drained request bytes alone do not prove
 quiescence. Terminal settlement retains the operation owner and physical permit
 until that work releases the root.
+The direct HTTPS root is bound to that accounting before handshake. A failed
+TLS attempt releases its physical root before another resolved address can use
+the same reserved dial slot; pump inactivity alone is not frame destruction.
+These exclusively library-created TLS/channel TCP roots disable socket linger
+before TLS/channel construction and close deterministically after their owned lower frames exit,
+including on io_uring. Queuing an asynchronous close is not the settlement
+boundary. This private policy does not change ordinary public TCP destruction
+or permit callers to destroy a frame with borrowed I/O still pending.
 
 `transport::clear()` atomically detaches idle entries with the pool-generation
 change; detached streams are destroyed outside lifecycle/pool locks. An

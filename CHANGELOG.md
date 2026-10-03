@@ -297,6 +297,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result was published; caller descriptor-lifetime responsibilities are unchanged
   (#1273).
 
+- **Direct HTTPS root retirement**: Transport binds operation and physical-capacity
+  accounting to owned TLS output before handshake, rejects idle publication
+  while internal frames remain, and waits for failed-attempt roots before retrying
+  another address. Private settled roots disable linger and close before
+  accounting release even on io_uring; ordinary TCP destruction is unchanged.
+  HTTP completion and pump inactivity no longer release root
+  accounting early (#1272).
+
 - **TLS numeric peer identity**: IPv4/IPv6 references now match IP-address SANs
   rather than DNS SANs/Common Names and do not send numeric SNI. An IPv6 local
   `%zone` is excluded from identity and SNI. Replacing the

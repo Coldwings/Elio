@@ -38,7 +38,11 @@
 
 namespace elio::tls {
 
-namespace detail { struct tls_idle_access; struct tls_retirement_access; }
+namespace detail {
+struct tls_idle_access;
+struct tls_retirement_access;
+struct tls_settlement_access;
+}
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
@@ -122,6 +126,42 @@ int lower_fd_or_negative(const Lower& lower) noexcept {
         return -1;
     }
 }
+
+// Keeps the transport-side cleanup capability alive across facade moves. This
+// is intentionally internal: ownership handoffs may retain it only to abort
+// and join unpublished TLS work after exceptional construction.
+template<typename Lower>
+class tls_settlement_handle {
+public:
+    explicit tls_settlement_handle(
+            std::shared_ptr<basic_tls_transport<Lower>> transport) noexcept
+        : transport_(std::move(transport)) {}
+
+    coro::task<void> abort_and_settle() const {
+        return abort_transport(transport_);
+    }
+
+private:
+    static coro::task<void> abort_transport(
+            std::shared_ptr<basic_tls_transport<Lower>> transport) {
+        if (transport) {
+            std::exception_ptr lower_exception;
+            transport->fail(ECANCELED);
+            if constexpr (net::publishing_byte_stream<Lower>) {
+                try {
+                    co_await transport->lower.abort_and_settle();
+                } catch (...) {
+                    lower_exception = std::current_exception();
+                }
+            }
+            co_await transport->settle_output();
+            if (lower_exception) std::rethrow_exception(lower_exception);
+        }
+        co_return;
+    }
+
+    std::shared_ptr<basic_tls_transport<Lower>> transport_;
+};
 } // namespace detail
 
 template<typename Lower = net::tcp_stream>
@@ -129,6 +169,7 @@ requires detail::tls_lower_stream<Lower>
 class basic_tls_stream {
     friend struct detail::tls_idle_access;
     friend struct detail::tls_retirement_access;
+    friend struct detail::tls_settlement_access;
 public:
     using byte_stream_contract = net::publishing_byte_stream_contract;
 
@@ -171,6 +212,10 @@ public:
         return {close_.write_closed, close_.peer_closed, close_.whole,
                 close_.driving, close_.done, transport_->output.accepted_bytes(),
                 transport_->output.drained_bytes()};
+    }
+    bool session_reused_for_test() const {
+        auto lock = lock_ssl_state();
+        return handshake_complete_ && SSL_session_reused(ssl_) == 1;
     }
 #endif
     /// Create a TLS stream from an existing async byte stream
@@ -670,20 +715,7 @@ public:
 
     /// Abort the owned lower chain and settle internal output work.
     coro::task<void> abort_and_settle() {
-        if (transport_) {
-            std::exception_ptr lower_exception;
-            transport_->fail(ECANCELED);
-            if constexpr (net::publishing_byte_stream<Lower>) {
-                try {
-                    co_await transport_->lower.abort_and_settle();
-                } catch (...) {
-                    lower_exception = std::current_exception();
-                }
-            }
-            co_await transport_->settle_output();
-            if (lower_exception) std::rethrow_exception(lower_exception);
-        }
-        co_return;
+        return detail::tls_settlement_handle<Lower>(transport_).abort_and_settle();
     }
     
     /// Get negotiated ALPN protocol
@@ -1356,6 +1388,15 @@ struct tls_retirement_access {
     }
 };
 
+// Internal exceptional-handoff support. A moved-from TLS facade cannot settle
+// the transport it transferred, but this retained handle can still join it.
+struct tls_settlement_access {
+    template<typename Lower>
+    static tls_settlement_handle<Lower> retain(basic_tls_stream<Lower>& stream) noexcept {
+        return tls_settlement_handle<Lower>(stream.transport_);
+    }
+};
+
 // Internal pooling snapshot, not a general concurrent-operation guarantee.
 // The caller has already settled its public TLS operations and holds exclusive
 // session ownership. Any remaining transport reference can still retain an
@@ -1363,20 +1404,83 @@ struct tls_retirement_access {
 struct tls_idle_access {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     template<typename Lower>
+    class output_probe {
+    public:
+        using state_type = typename basic_tls_transport<Lower>::output_test_state;
+
+        std::optional<state_type> snapshot() const noexcept {
+            auto owner = owner_.lock();
+            if (!owner) return std::nullopt;
+            return owner->output_state_for_test();
+        }
+
+        bool expired() const noexcept { return owner_.expired(); }
+
+    private:
+        friend struct tls_idle_access;
+        explicit output_probe(std::weak_ptr<basic_tls_transport<Lower>> owner) noexcept
+            : owner_(std::move(owner)) {}
+        std::weak_ptr<basic_tls_transport<Lower>> owner_;
+    };
+
+    template<typename Lower>
+    static output_probe<Lower> output_probe_for_test(
+            basic_tls_stream<Lower>& stream) noexcept {
+        return output_probe<Lower>(stream.transport_);
+    }
+
+    template<typename Lower>
+    static void set_read_publish_hook_for_test(basic_tls_stream<Lower>& stream,
+            void* context, void (*hook)(void*)) noexcept {
+        // Install before publishing the session; keep context alive until all
+        // public operations and retained transport frames have settled.
+        stream.transport_->read_publish_context = context;
+        stream.transport_->before_read_publish = hook;
+    }
+
+    template<typename Lower>
+    static coro::task<io::io_result> flush_output_for_test(
+            basic_tls_stream<Lower>& stream, coro::cancel_token token) {
+        uint64_t watermark;
+        {
+            auto lock = stream.lock_ssl_state();
+            watermark = stream.transport_->output.accepted_bytes();
+        }
+        return stream.transport_->flush_to(watermark, std::move(token));
+    }
+
+    template<typename Lower>
     static int queue_plaintext_for_test(
             basic_tls_stream<Lower>& stream, const void* data, size_t size) {
         return stream.call_write(data, size).ret;
     }
+
+    template<typename Lower>
+    static Lower& lower_for_test(basic_tls_stream<Lower>& stream) noexcept {
+        return stream.transport_->lower;
+    }
+
+    template<typename Lower>
+    static coro::task<io::io_result> read_lower_for_test(
+            basic_tls_stream<Lower>& stream, void* data, size_t size) {
+        return stream.transport_->lower.read(data, size, {});
+    }
 #endif
     template<typename Lower>
     static bool is_quiescent(const basic_tls_stream<Lower>& stream) noexcept {
+        return is_quiescent(stream, [](const Lower&) noexcept { return true; });
+    }
+
+    template<typename Lower, typename Check>
+    static bool is_quiescent(const basic_tls_stream<Lower>& stream, Check check) noexcept {
         if (!stream.transport_) return false;
         auto lock = stream.lock_ssl_state();
         return stream.transport_.use_count() == 1 && !stream.transport_->pump_active_ &&
             stream.transport_->output.pending().empty() &&
             !stream.transport_->operation_error() && !stream.write_pending_ &&
             !stream.write_retry_exclusive_ && !stream.close_.whole &&
-            !stream.close_.write_closed && !stream.close_.peer_closed;
+            !stream.close_.write_closed && !stream.close_.peer_closed &&
+            check(std::as_const(stream.transport_->lower));
     }
 };
 

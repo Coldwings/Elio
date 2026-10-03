@@ -160,8 +160,14 @@ jobs:
       shell: bash
       run: |
         set -o pipefail
-        ./build/tests/elio_tests_asan --reporter compact --abort 2>&1 \
-          | tee test-logs/catch-asan.log
+        # Keep the heavier HTTP-client matrices under an independent process
+        # watchdog without removing tests or increasing their timeouts.
+        ./build/tests/elio_tests_asan '~[http_client_streaming]' \
+          --reporter compact --abort 2>&1 \
+          | tee test-logs/catch-asan-core.log
+        ./build/tests/elio_tests_asan '[http_client_streaming]' \
+          --reporter compact --abort 2>&1 \
+          | tee test-logs/catch-asan-http-client-streaming.log
       env:
         ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:log_path=${{ github.workspace }}/test-logs/asan-${{ matrix.arch.name }}-${{ matrix.build_type }}
 

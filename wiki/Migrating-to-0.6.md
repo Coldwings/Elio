@@ -80,9 +80,13 @@ lease that retains the original state owner and defaults to abort/retirement.
 Only validated completion returns it; destruction never drains or reuses an
 unfinished body. Explicit external leases remain a follow-up feature; raw
 transport acquire/release is not public API in 0.6. Transport-wide live/dial
-admission is opt-in through `transport_config::limits`. Explicit plain HTTP
-proxy forwarding and CONNECT routes are supported; HTTPS proxies remain a
-follow-up. Client-managed exchanges strip generic `Proxy-Authorization` headers
+admission is opt-in through `transport_config::limits`. Explicit HTTP/HTTPS
+proxy forwarding and CONNECT routes are supported. Proxy TLS now has separate
+`proxy.verify_certificate` and construction-only `proxy.configure_tls`; existing
+Transport TLS options remain origin-only. Both default to certificate verification,
+and proxy ALPN is HTTP/1.1-only. `client_stage::proxy_tls` is appended without
+renumbering existing stages. No HTTP/2 CONNECT or implicit scheme detection is added.
+Client-managed exchanges strip generic `Proxy-Authorization` headers
 and use only `proxy.basic_auth` for hop credentials, including when callers
 previously set that header on direct routes.
 Existing standalone `connection_pool` signatures remain adapters in

@@ -22,8 +22,8 @@
 - **File Helpers**: High-level async read/write/append operations
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
-- **HTTP proxy client**: explicit plain HTTP forwarding and HTTPS-origin CONNECT,
-  with frozen hop credentials and bounded setup ([guide](wiki/HTTP-Routing.md#explicit-plain-http-proxy))
+- **HTTP proxy client**: explicit HTTP/HTTPS proxy forwarding and HTTPS-origin CONNECT,
+  with frozen hop credentials and bounded setup ([guide](wiki/HTTP-Routing.md#explicit-http-and-https-proxy))
 - **HTTP CONNECT**: server-owned tunnel handoff and bounded duplex relay,
   including HTTPS proxies ([guide](wiki/HTTP-Streaming.md#connect-tunnel-handoff))
 - **HTTP/2**: HTTPS client built on nghttp2 with HPACK and stream handling

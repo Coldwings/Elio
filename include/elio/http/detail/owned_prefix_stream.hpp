@@ -18,11 +18,14 @@
 
 namespace elio::http::detail {
 
+struct prefix_idle_access;
+
 // CONNECT owns this prefix; lower EOF and readiness cannot skip it. The TCP
 // root is adapted explicitly, not opted into the publishing concept globally.
 template<typename Lower>
 requires (std::same_as<Lower, net::tcp_stream> || net::publishing_byte_stream<Lower>)
 class owned_prefix_stream {
+    friend struct prefix_idle_access;
     struct state {
         state(Lower value, std::vector<char> bytes, std::shared_ptr<void> lifetime)
             : retirement(std::move(lifetime)), lower(std::move(value)), prefix(std::move(bytes)) {}
@@ -234,6 +237,25 @@ private:
     }
 
     std::shared_ptr<state> owner_;
+};
+
+// Internal recursive pooling check. Public/lower frames must be gone before
+// inspecting unread prefix and nested TLS state; inactivity alone is not enough.
+struct prefix_idle_access {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    template<typename Lower>
+    static Lower& lower_for_test(owned_prefix_stream<Lower>& stream) noexcept {
+        return stream.owner_->lower;
+    }
+#endif
+    template<typename Lower, typename Check>
+    static bool is_quiescent(const owned_prefix_stream<Lower>& stream, Check check) noexcept {
+        if (!stream.owner_) return false;
+        const auto& owner = stream.owner_;
+        std::lock_guard lock(owner->mutex);
+        return owner.use_count() == 1 && owner->active == 0 && !owner->sealed &&
+            owner->offset == owner->prefix.size() && check(std::as_const(owner->lower));
+    }
 };
 
 } // namespace elio::http::detail

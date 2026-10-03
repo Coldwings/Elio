@@ -155,6 +155,7 @@ public:
     bool use_default_verify_paths() { return ctx_.use_default_verify_paths(); }
     void set_verify_mode(tls::verify_mode mode) { ctx_.set_verify_mode(mode); }
     bool set_alpn_protocols(std::string_view protocols) {
+        if (http1_only_ && !protocols.empty() && protocols != "http/1.1") return false;
         return ctx_.set_alpn_protocols(protocols);
     }
     bool set_ciphers(std::string_view ciphers) { return ctx_.set_ciphers(ciphers); }
@@ -168,9 +169,17 @@ public:
 private:
     friend class transport;
 
+    transport_tls_config(bool verify_certificate, bool http1_only)
+        : transport_tls_config(verify_certificate) {
+        http1_only_ = http1_only;
+        if (http1_only_ && !ctx_.set_alpn_protocols("http/1.1"))
+            throw std::runtime_error("HTTP proxy ALPN configuration failed");
+    }
+
     tls::tls_context release_context() && noexcept { return std::move(ctx_); }
 
     tls::tls_context ctx_;
+    bool http1_only_ = false;
 };
 
 struct transport_tls_diagnostics {
@@ -190,7 +199,7 @@ struct transport_config {
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
     std::optional<pool_limits> limits;             ///< Absent preserves legacy admission
     std::chrono::nanoseconds acquisition_timeout{0}; ///< One absolute acquisition budget
-    std::optional<http_proxy_config> proxy;         ///< Plain HTTP forward/CONNECT hop
+    std::optional<http_proxy_config> proxy;         ///< HTTP/HTTPS forward/CONNECT hop
     /// Optional construction-time TLS customization. It runs after Elio's
     /// default client TLS initialization on a builder that is moved into the
     /// transport only after this callback returns.
@@ -761,7 +770,16 @@ private:
         snapshot.origin_tls = std::make_shared<tls::tls_context>(make_tls_context(config));
         if (config.proxy) {
             snapshot.proxy = detail::freeze_proxy_profile(*config.proxy);
-            snapshot.hops.push_back({snapshot.proxy->endpoint, 0, snapshot.proxy->auth_domain});
+            uint64_t proxy_tls_domain = 0;
+            if (snapshot.proxy->secure) {
+                transport_tls_config builder(config.proxy->verify_certificate, true);
+                if (config.proxy->configure_tls) config.proxy->configure_tls(builder);
+                snapshot.proxy_tls = std::make_shared<tls::tls_context>(
+                    std::move(builder).release_context());
+                proxy_tls_domain = detail::new_route_domain();
+            }
+            snapshot.hops.push_back({snapshot.proxy->endpoint, proxy_tls_domain,
+                                     snapshot.proxy->auth_domain});
             snapshot.target_dns = detail::route_dns_mode::proxy;
         }
         return std::make_shared<const detail::route_snapshot>(std::move(snapshot));

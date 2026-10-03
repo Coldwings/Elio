@@ -197,10 +197,13 @@ if (!co_await stream.handshake(token)) {
 
 Each TLS layer has its own context, SNI, verification mode, ALPN and session
 state. For example, HTTPS-through-HTTPS proxying uses an outer TLS stream for
-the proxy connection, then an inner `basic_tls_stream<tls_stream>` for the
-origin after the CONNECT tunnel is established. The inner layer's ciphertext is
-written through the outer stream; `fd()` diagnostics never authorize bypassing
-the lower protocol.
+the proxy connection, then an inner `basic_tls_stream` over an owned CONNECT
+channel after the tunnel is established. That channel wraps the outer
+`tls_stream` together with any bytes read past the CONNECT response boundary,
+so the concrete layering is equivalent to
+`basic_tls_stream<owned_prefix_stream<tls_stream>>`. The inner layer's
+ciphertext is written through that channel; `fd()` diagnostics never authorize
+bypassing the buffered prefix or lower protocol.
 
 ### TLS Listener (Server)
 

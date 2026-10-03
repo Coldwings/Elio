@@ -146,6 +146,7 @@ struct route_snapshot {
     std::chrono::nanoseconds dns_timeout{0};
     std::shared_ptr<net::resolve_domain> dns_domain;
     std::shared_ptr<tls::tls_context> origin_tls;
+    std::shared_ptr<tls::tls_context> proxy_tls;
     std::shared_ptr<const proxy_profile> proxy;
 };
 

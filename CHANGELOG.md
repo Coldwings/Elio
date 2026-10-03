@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTTPS proxy routes with independent TLS domains**: `http_proxy_config`
+  accepts explicit HTTPS endpoints and adds proxy-only `verify_certificate`
+  and construction-time `configure_tls`. Origin TLS policy remains unchanged.
+  HTTP forwards inside proxy TLS; HTTPS composes the generic TLS core twice
+  around an owned CONNECT prefix. Outer ALPN is HTTP/1.1-only; `proxy_tls` is
+  appended as a distinct failure stage. Complete keys, one remaining setup
+  budget, recursive idle quiescence and physical-root retirement cover both
+  TLS layers. No SOCKS, automatic replay, multi-hop or HTTP/2 CONNECT (#1250).
+
 - **Explicit plain HTTP proxy routes**: frozen `http_proxy_config` enables
   absolute-form HTTP forwarding and target-bound CONNECT followed by origin TLS.
   Caller CONNECT requests on explicit proxy clients fail with `ENOTSUP` before
@@ -22,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generic Proxy-Authorization is stripped from direct/tunneled requests and
   forwarding uses only the frozen profile. Configure `proxy.basic_auth` instead
   of custom hop headers; public request serialization and standalone connection
-  types/pools are unchanged. No environment discovery, automatic replay, HTTPS
-  proxy, SOCKS, multi-hop or HTTP/2 proxy is added (#1249).
+  types/pools are unchanged. This plain-proxy foundation adds no environment
+  discovery, automatic replay, SOCKS, multi-hop or HTTP/2 proxy (#1249);
+  HTTPS proxy composition is described separately above (#1250).
 
 - **Opt-in finite HTTP Transport admission**: separate route/global idle and
   live limits, reserved dial slots, bounded FIFO waiters and route metadata.
@@ -83,8 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so hash collisions cannot authorize reuse. Redirects resolve new plans and
   replacement transports keep separate published policy domains. Proxy and
   layered-TLS identity fields are modeled conservatively per origin; their
-  plain HTTP proxy connectors are now provided by #1249; HTTPS proxy connectors
-  remain separate features. Legacy standalone pool adapters retain
+  plain HTTP proxy connectors are now provided by #1249, and HTTPS proxy
+  connectors are provided by #1250. Legacy standalone pool adapters retain
   their stable caller-policy contract in a separate namespace. HTTP/1 diagnostics
   no longer log serialized requests or complete redirect URLs (#1246).
 

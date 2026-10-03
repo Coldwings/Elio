@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -22,6 +24,7 @@ inline std::atomic<route_operation_wait_hook> route_operation_wait_for_test{null
 inline std::atomic<void (*)()> route_watchdog_before_construct_for_test{nullptr};
 inline std::atomic<coro::task<void> (*)()> route_watchdog_after_start_for_test{nullptr};
 inline std::atomic<void (*)()> route_operation_entered_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> route_operation_completed_for_test{nullptr};
 #endif
 
 inline coro::task<void> route_watchdog_task(
@@ -71,13 +74,16 @@ struct route_operation_result {
 // A layered stream cannot be timed out by bypassing it through the TCP fd.
 // Cancel the actual lower operation and join both tasks before its owner,
 // buffers or published prefix can leave the enclosing exchange/setup frame.
-template<typename Result, typename Operation>
+template<typename Result, typename Operation, typename FailureCleanup = std::nullptr_t>
 coro::task<route_operation_result<Result>> await_route_operation(Operation operation,
         coro::cancel_token token,
-        std::optional<std::chrono::steady_clock::time_point> deadline) {
+        std::optional<std::chrono::steady_clock::time_point> deadline,
+        FailureCleanup cleanup_completed_on_failure = nullptr) {
     auto* scheduler = runtime::scheduler::current();
-    if (!deadline || !scheduler)
-        co_return route_operation_result<Result>{co_await std::invoke(operation, token), false};
+    if (!deadline || !scheduler) {
+        auto value = co_await std::invoke(operation, token);
+        co_return route_operation_result<Result>{std::move(value), false};
+    }
     auto stop = std::make_shared<coro::cancel_source>();
     auto expired = std::make_shared<std::atomic<bool>>(false);
     auto forward = token.on_cancel([stop] { stop->cancel(); });
@@ -112,6 +118,10 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
 #endif
         value.emplace(co_await std::invoke(operation, stop->get_token()));
         completed_late = std::chrono::steady_clock::now() >= *deadline;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = route_operation_completed_for_test.load(std::memory_order_acquire))
+            co_await hook();
+#endif
     } catch (...) {
         failure = std::current_exception();
     }
@@ -121,7 +131,19 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     catch (...) { if (!failure) failure = std::current_exception(); }
     try { co_await watchdog.wait_destroyed_async(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
-    if (failure) std::rethrow_exception(failure);
+    if (failure) {
+        // The operation may have transferred an owning result before its
+        // watchdog reports an independent failure. Let the caller retire that
+        // completed value inside this frame instead of destroying it blindly.
+        if (value) {
+            if constexpr (!std::same_as<std::remove_cvref_t<FailureCleanup>,
+                                         std::nullptr_t>) {
+                try { co_await std::invoke(cleanup_completed_on_failure, *value); }
+                catch (...) {}
+            }
+        }
+        std::rethrow_exception(failure);
+    }
     co_return route_operation_result<Result>{std::move(*value),
         completed_late || expired->load(std::memory_order_acquire)};
 }

@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/coro/detail/completion_waiter.hpp>
+#include <elio/coro/with_timeout.hpp>
 #include <elio/http/http_client.hpp>
 #include <elio/coro/join_wait.hpp>
 #include <elio/io/io_awaitables.hpp>
@@ -1043,7 +1044,7 @@ TEST_CASE("Idle handoff cannot erase the next tunnel lease retirement owner",
 }
 
 TEST_CASE("Tunnel roots with lower frames retire until those frames release",
-          "[http][proxy][routes][handoff][shutdown][issue-1249][issue-1250]") {
+          "[http][proxy][routes][handoff][shutdown][issue-1249][issue-1250][http_client_streaming]") {
     using namespace elio::http::detail;
     for (const bool finite : {false, true}) {
         CAPTURE(finite);
@@ -4394,14 +4395,20 @@ task<void> serve_nested_close_proxy(elio::net::tcp_listener& listener,
                     *origin, outer, connection == 0 ? &observed : nullptr,
                     connection_token)));
                 if (connection == 0) {
-                    const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(10);
-                    while (!observed.first_response_drained.is_set() &&
-                           !relays[1]->is_ready() && !connection_token.is_cancelled() &&
-                           std::chrono::steady_clock::now() < deadline) {
-                        co_await elio::time::yield();
-                    }
-                    if (!observed.first_response_drained.is_set())
+                    const auto drained = co_await elio::with_timeout(
+                        std::chrono::seconds(10),
+                        [&](elio::coro::cancel_token timeout_token) -> task<bool> {
+                            elio::coro::cancel_source wait_stop;
+                            auto timeout_cancel = timeout_token.on_cancel(
+                                [wait_stop]() mutable { wait_stop.cancel(); });
+                            auto connection_cancel = connection_token.on_cancel(
+                                [wait_stop]() mutable { wait_stop.cancel(); });
+                            const auto result = co_await observed.first_response_drained.wait(
+                                wait_stop.get_token());
+                            co_return result == elio::coro::cancel_result::completed;
+                        });
+                    if (!drained || !*drained ||
+                        !observed.first_response_drained.is_set())
                         throw std::runtime_error(
                             "nested close response did not drain through proxy");
                     if (kind == nested_close_kind::close_notify) {
@@ -4969,7 +4976,7 @@ task<client_result<std::monostate>> read_buffered_proxy_body(client& agent,
 } // namespace
 
 TEST_CASE("HTTPS forward proxy consumes buffered TLS plaintext without another lower read",
-          "[http][proxy][tls][routes][buffered-plaintext][issue-1250]") {
+          "[http][proxy][tls][routes][buffered-plaintext][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5076,7 +5083,7 @@ TEST_CASE("HTTPS forward proxy consumes buffered TLS plaintext without another l
 }
 
 TEST_CASE("HTTPS proxy and separate origin authenticate independent client identities",
-          "[http][proxy][tls][routes][mutual][issue-1250]") {
+          "[http][proxy][tls][routes][mutual][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5201,7 +5208,7 @@ TEST_CASE("HTTPS proxy and separate origin authenticate independent client ident
 }
 
 TEST_CASE("Nested HTTPS output frames retain physical root accounting through shutdown",
-          "[http][proxy][tls][routes][nested-output][issue-1250]") {
+          "[http][proxy][tls][routes][nested-output][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5360,7 +5367,7 @@ TEST_CASE("Nested HTTPS output frames retain physical root accounting through sh
 }
 
 TEST_CASE("Nested HTTPS handoff exceptions settle retained outer TLS output",
-          "[http][proxy][tls][routes][nested-handoff][issue-1250]") {
+          "[http][proxy][tls][routes][nested-handoff][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5445,7 +5452,7 @@ TEST_CASE("Nested HTTPS handoff exceptions settle retained outer TLS output",
 }
 
 TEST_CASE("HTTPS proxy forwards inner TLS to a separate authenticated origin",
-          "[http][proxy][tls][routes][forwarding][issue-1250]") {
+          "[http][proxy][tls][routes][forwarding][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5566,7 +5573,7 @@ TEST_CASE("HTTPS proxy forwards inner TLS to a separate authenticated origin",
 }
 
 TEST_CASE("Nested HTTPS closures retire the target-bound tunnel before reuse",
-          "[http][proxy][tls][routes][close][issue-1250]") {
+          "[http][proxy][tls][routes][close][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto proxy_version = GENERATE(elio::tls::tls_version::tls_1_2,
                                         elio::tls::tls_version::tls_1_3);
@@ -5741,7 +5748,7 @@ TEST_CASE("Nested HTTPS closures retire the target-bound tunnel before reuse",
 }
 
 TEST_CASE("Nested HTTPS slow-peer cancellation settles bounded borrowed ciphertext",
-          "[http][proxy][tls][routes][backpressure][issue-1250]") {
+          "[http][proxy][tls][routes][backpressure][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto proxy_version = GENERATE(elio::tls::tls_version::tls_1_2,
                                         elio::tls::tls_version::tls_1_3);
@@ -5854,7 +5861,7 @@ TEST_CASE("Nested HTTPS slow-peer cancellation settles bounded borrowed cipherte
 }
 
 TEST_CASE("HTTPS proxy retries resolved addresses after an outer TLS failure",
-          "[http][proxy][tls][routes][retry][issue-1250]") {
+          "[http][proxy][tls][routes][retry][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -5949,7 +5956,7 @@ TEST_CASE("HTTPS proxy retries resolved addresses after an outer TLS failure",
 }
 
 TEST_CASE("HTTPS proxy preserves an outer TLS failure across later connection failures",
-          "[http][proxy][tls][authentication][retry][issue-1250]") {
+          "[http][proxy][tls][authentication][retry][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     CAPTURE(selected);
     backend_guard backend_scope(selected);
@@ -6023,7 +6030,7 @@ TEST_CASE("HTTPS proxy preserves an outer TLS failure across later connection fa
 }
 
 TEST_CASE("Failed HTTPS proxy TLS retains capacity until its output root retires",
-          "[http][proxy][tls][routes][retirement][setup-failure][issue-1250]") {
+          "[http][proxy][tls][routes][retirement][setup-failure][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     CAPTURE(selected);
     backend_guard backend_scope(selected);
@@ -6121,7 +6128,7 @@ TEST_CASE("Failed HTTPS proxy TLS retains capacity until its output root retires
 }
 
 TEST_CASE("Cancelled HTTPS proxy setup joins retained post-handshake TLS output",
-          "[http][proxy][tls][routes][retirement][cancel][issue-1250]") {
+          "[http][proxy][tls][routes][retirement][cancel][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6225,7 +6232,7 @@ TEST_CASE("Cancelled HTTPS proxy setup joins retained post-handshake TLS output"
 }
 
 TEST_CASE("Cancelled successful nested setup settles retained route output",
-          "[http][proxy][tls][routes][retirement][completion-cancel][issue-1250]") {
+          "[http][proxy][tls][routes][retirement][completion-cancel][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6374,7 +6381,7 @@ TEST_CASE("Cancelled successful nested setup settles retained route output",
 }
 
 TEST_CASE("Failed watchdog settles its already-completed nested HTTPS route",
-          "[http][proxy][tls][routes][retirement][watchdog-failure][issue-1250]") {
+          "[http][proxy][tls][routes][retirement][watchdog-failure][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6544,7 +6551,7 @@ TEST_CASE("Failed watchdog settles its already-completed nested HTTPS route",
 }
 
 TEST_CASE("Rejected HTTPS proxy route watchdog settles retained outer TLS output",
-          "[http][proxy][tls][routes][retirement][watchdog-rejection][issue-1250]") {
+          "[http][proxy][tls][routes][retirement][watchdog-rejection][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6643,7 +6650,7 @@ TEST_CASE("Rejected HTTPS proxy route watchdog settles retained outer TLS output
 }
 
 TEST_CASE("HTTPS proxy redirects isolate forward and tunneled TLS routes",
-          "[http][proxy][tls][routes][redirect][issue-1250]") {
+          "[http][proxy][tls][routes][redirect][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6742,7 +6749,7 @@ TEST_CASE("HTTPS proxy redirects isolate forward and tunneled TLS routes",
 }
 
 TEST_CASE("HTTPS proxy credential rotation starts a separate TLS session domain",
-          "[http][proxy][tls][routes][rotation][resumption][issue-1250]") {
+          "[http][proxy][tls][routes][rotation][resumption][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -6855,7 +6862,7 @@ TEST_CASE("HTTPS proxy credential rotation starts a separate TLS session domain"
 }
 
 TEST_CASE("HTTPS proxy routes authenticate both layers and reuse only compatible channels",
-          "[http][proxy][tls][routes][issue-1250]") {
+          "[http][proxy][tls][routes][issue-1250][http_client_streaming]") {
     elio::tls::tls_context proxy_context(elio::tls::tls_mode::server);
     elio::tls::tls_context origin_context(elio::tls::tls_mode::server);
     temporary_pem proxy_ca, origin_ca;
@@ -6960,7 +6967,7 @@ TEST_CASE("HTTPS proxy routes authenticate both layers and reuse only compatible
 }
 
 TEST_CASE("HTTPS proxy and origin certificate rejection identify independent security stages",
-          "[http][proxy][tls][authentication][issue-1250]") {
+          "[http][proxy][tls][authentication][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto rejected = GENERATE(0, 1, 2, 3);
     backend_guard backend_scope(selected);
@@ -7058,7 +7065,7 @@ task<void> stall_https_setup(elio::net::tcp_listener& listener,
 } // namespace
 
 TEST_CASE("HTTPS proxy setup shares one deadline and joins cancellation in every TLS phase",
-          "[http][proxy][tls][deadline][cancel][issue-1250]") {
+          "[http][proxy][tls][deadline][cancel][issue-1250][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto phase = GENERATE(0, 1, 2);
     const auto expire = GENERATE(false, true);

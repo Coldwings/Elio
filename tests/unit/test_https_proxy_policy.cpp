@@ -12,7 +12,7 @@ static_assert(static_cast<int>(client_stage::proxy_connect) == 9);
 static_assert(static_cast<int>(client_stage::proxy_tls) == 10);
 
 TEST_CASE("HTTPS proxy policies keep proxy and origin verification independent",
-          "[http][proxy][tls][policy][issue-1250]") {
+          "[http][proxy][tls][policy][issue-1250][http_client_streaming]") {
     const auto verify_origin = GENERATE(false, true);
     const auto verify_proxy = GENERATE(false, true);
     transport_config config;
@@ -62,7 +62,7 @@ TEST_CASE("HTTPS proxy policies keep proxy and origin verification independent",
 }
 
 TEST_CASE("HTTPS proxy profiles default to verification and isolate complete security domains",
-          "[http][proxy][tls][policy][issue-1250]") {
+          "[http][proxy][tls][policy][issue-1250][http_client_streaming]") {
     http_proxy_config defaults;
     CHECK(defaults.verify_certificate);
     transport_config config;
@@ -87,7 +87,7 @@ TEST_CASE("HTTPS proxy profiles default to verification and isolate complete sec
 }
 
 TEST_CASE("Plain proxy profiles do not invoke or publish a proxy TLS policy",
-          "[http][proxy][tls][policy][issue-1250]") {
+          "[http][proxy][tls][policy][issue-1250][http_client_streaming]") {
     transport_config config;
     config.proxy.emplace();
     config.proxy->endpoint = "http://proxy.example/";
@@ -104,7 +104,7 @@ TEST_CASE("Plain proxy profiles do not invoke or publish a proxy TLS policy",
 }
 
 TEST_CASE("HTTPS proxy reference validation rejects widened or unsafe authentication names",
-          "[http][proxy][tls][policy][issue-1250]") {
+          "[http][proxy][tls][policy][issue-1250][http_client_streaming]") {
     const auto endpoint = GENERATE("https://.example/", "https://%2Eexample/",
         "https://proxy%00.example/", "https://proxy%2Fexample/",
         "https://user:secret@proxy.example/", "https://proxy.example/path");

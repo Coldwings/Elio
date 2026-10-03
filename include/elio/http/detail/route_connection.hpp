@@ -15,6 +15,10 @@ namespace elio::http::detail {
 
 using connect_channel = owned_prefix_stream<net::tcp_stream>;
 using connect_tls_stream = tls::basic_tls_stream<connect_channel>;
+using nested_connect_channel = owned_prefix_stream<connect_tls_stream>;
+using nested_connect_tls_stream = tls::basic_tls_stream<nested_connect_channel>;
+using secure_proxy_channel = owned_prefix_stream<tls::tls_stream>;
+using secure_proxy_origin_tls_stream = tls::basic_tls_stream<secure_proxy_channel>;
 struct route_retirement;
 
 // The public closed TCP/TLS facade remains unchanged. Only Transport owns
@@ -30,6 +34,12 @@ public:
             tls::detail::tls_retirement_access::bind(legacy.as_tls(), retirement_);
     }
     explicit route_connection(connect_tls_stream stream,
+            std::shared_ptr<route_retirement> retirement = {}) noexcept
+        : retirement_(std::move(retirement)), stream_(std::move(stream)) {}
+    explicit route_connection(nested_connect_tls_stream stream,
+            std::shared_ptr<route_retirement> retirement = {}) noexcept
+        : retirement_(std::move(retirement)), stream_(std::move(stream)) {}
+    explicit route_connection(secure_proxy_origin_tls_stream stream,
             std::shared_ptr<route_retirement> retirement = {}) noexcept
         : retirement_(std::move(retirement)), stream_(std::move(stream)) {}
     route_connection(route_connection&&) noexcept = default;
@@ -96,13 +106,12 @@ public:
     coro::task<void> abort_and_settle() {
         return std::visit([](auto& stream) -> coro::task<void> {
             using stream_type = std::decay_t<decltype(stream)>;
-            if constexpr (std::same_as<stream_type, connect_tls_stream>)
-                return stream.abort_and_settle();
-            else if constexpr (std::same_as<stream_type, net::stream>) {
+            if constexpr (std::same_as<stream_type, net::stream>) {
                 if (stream.is_tls()) return stream.as_tls().abort_and_settle();
                 if (stream.is_tcp()) stream.as_tcp().shutdown_socket();
                 return settled();
-            } else return settled();
+            } else if constexpr (std::same_as<stream_type, std::monostate>) return settled();
+            else return stream.abort_and_settle();
         }, stream_);
     }
 
@@ -110,7 +119,23 @@ public:
 
     bool io_quiescent() const noexcept {
         const auto* tunnel = std::get_if<connect_tls_stream>(&stream_);
-        if (tunnel) return tls::detail::tls_idle_access::is_quiescent(*tunnel);
+        if (tunnel) return root_tls_quiescent(*tunnel);
+        const auto* nested = std::get_if<nested_connect_tls_stream>(&stream_);
+        if (nested) return tls::detail::tls_idle_access::is_quiescent(*nested,
+            [](const nested_connect_channel& channel) noexcept {
+                return prefix_idle_access::is_quiescent(channel,
+                    [](const connect_tls_stream& outer) noexcept {
+                        return root_tls_quiescent(outer);
+                    });
+            });
+        const auto* secure_nested = std::get_if<secure_proxy_origin_tls_stream>(&stream_);
+        if (secure_nested) return tls::detail::tls_idle_access::is_quiescent(*secure_nested,
+            [](const secure_proxy_channel& channel) noexcept {
+                return prefix_idle_access::is_quiescent(channel,
+                    [](const tls::tls_stream& outer) noexcept {
+                        return tls::detail::tls_idle_access::is_quiescent(outer);
+                    });
+            });
         const auto* legacy = std::get_if<net::stream>(&stream_);
         return !legacy || !legacy->is_tls() ||
             tls::detail::tls_idle_access::is_quiescent(legacy->as_tls());
@@ -122,6 +147,13 @@ public:
         return legacy ? legacy->fd() : -1;
     }
     bool is_connected() const noexcept { return !std::holds_alternative<std::monostate>(stream_); }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    coro::task<io::io_result> read_lower_for_test(void* data, size_t size) {
+        auto* tunnel = std::get_if<connect_tls_stream>(&stream_);
+        return tunnel ? tls::detail::tls_idle_access::read_lower_for_test(*tunnel, data, size)
+                      : disconnected_io();
+    }
+#endif
     auto last_use() const noexcept { return last_use_; }
     void touch() noexcept { last_use_ = std::chrono::steady_clock::now(); }
 
@@ -134,12 +166,20 @@ public:
     }
 
 private:
+    static bool root_tls_quiescent(const connect_tls_stream& stream) noexcept {
+        return tls::detail::tls_idle_access::is_quiescent(stream,
+            [](const connect_channel& channel) noexcept {
+                return prefix_idle_access::is_quiescent(channel,
+                    [](const net::tcp_stream&) noexcept { return true; });
+            });
+    }
     static coro::task<void> settled() { co_return; }
     static coro::task<io::io_result> disconnected_io() {
         co_return io::io_result{-ENOTCONN, 0};
     }
     std::shared_ptr<route_retirement> retirement_;
-    std::variant<std::monostate, net::stream, connect_tls_stream> stream_;
+    std::variant<std::monostate, net::stream, connect_tls_stream, nested_connect_tls_stream,
+                 secure_proxy_origin_tls_stream> stream_;
     std::chrono::steady_clock::time_point last_use_ = std::chrono::steady_clock::now();
 };
 

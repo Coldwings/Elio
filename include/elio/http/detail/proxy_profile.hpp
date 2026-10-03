@@ -106,6 +106,7 @@ inline std::string proxy_origin_tls_name(std::string_view host) {
 
 struct proxy_profile {
     route_endpoint endpoint;
+    bool secure = false;
     uint64_t auth_domain = 0;
     std::string authorization;
     proxy_connect_limits limits;
@@ -140,12 +141,15 @@ inline std::shared_ptr<const proxy_profile> freeze_proxy_profile(const http_prox
         config.endpoint.find_first_of("@?#") != std::string::npos)
         throw std::invalid_argument("HTTP proxy requires an explicit bounded endpoint URI");
     const auto parsed = url::parse(config.endpoint);
-    if (!parsed || parsed->scheme != "http" || !parsed->userinfo.empty() ||
+    if (!parsed || (parsed->scheme != "http" && parsed->scheme != "https") || !parsed->userinfo.empty() ||
         parsed->path != "/" || !parsed->query.empty() || !parsed->fragment.empty() ||
         !valid_proxy_uri_authority(config.endpoint, *parsed))
-        throw std::invalid_argument("HTTP proxy endpoint must be a plain HTTP authority");
+        throw std::invalid_argument("HTTP proxy endpoint must be an HTTP or HTTPS authority");
+    if (parsed->is_secure() && !valid_proxy_tls_reference(parsed->host))
+        throw std::invalid_argument("Invalid proxy TLS reference name");
     auto profile = std::make_shared<proxy_profile>();
     profile->endpoint = route_endpoint::from(decoded_proxy_host(parsed->host), parsed->effective_port());
+    profile->secure = parsed->is_secure();
     profile->limits = config.connect_limits;
     if (config.basic_auth) {
         profile->authorization = proxy_basic_authorization(*config.basic_auth);

@@ -344,6 +344,18 @@ inline coro::task<void> make_setup_watchdog(
                                std::move(op_source), std::move(flag));
 }
 
+struct tls_connect_observer {
+    client_stage failure_stage = client_stage::tls;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    void (*created)(tls::tls_stream&) = nullptr;
+    void (*setup_entered)() = nullptr;
+    void (*failed)(tls::tls_stream&, int) = nullptr;
+    void (*ready)(tls::tls_stream&) = nullptr;
+    coro::task<void> (*before_publish)(tls::tls_stream&) = nullptr;
+    bool replace_default_hooks = false;
+#endif
+};
+
 // Transport-created roots have no caller alias and retire only after borrowed
 // exchange operations settle. Keep this policy out of the public connector.
 // The awaiting route connector may borrow the private deadline output so later
@@ -360,7 +372,8 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {},
                bool settled_root = false,
                std::optional<std::chrono::steady_clock::time_point>* setup_deadline_output = nullptr,
-               std::shared_ptr<void> retirement = {}) {
+               std::shared_ptr<void> retirement = {},
+               tls_connect_observer tls_observer = {}) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
@@ -461,9 +474,10 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
 #endif
         if (secure) {
             if (!tls_ctx) {
-                co_return detail::make_client_error(EINVAL, client_stage::tls);
+                co_return detail::make_client_error(EINVAL, tls_observer.failure_stage);
             }
 
+            bool handshake_failed = false;
             for (size_t i = 0; i < addresses.size(); ++i) {
                 const auto& addr = addresses[(offset + i) % addresses.size()];
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -481,7 +495,10 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                     co_return *error;
                 }
                 if (!tcp) {
-                    last_error = detail::make_client_error(tcp_error, client_stage::connect);
+                    if (!handshake_failed) {
+                        last_error = detail::make_client_error(
+                            tcp_error, client_stage::connect);
+                    }
                     continue;
                 }
 
@@ -491,22 +508,32 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                 if (retirement)
                     root_released = tls::detail::tls_retirement_access::bind(tls_stream, retirement);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = detail::client_tls_created_for_test.load(std::memory_order_acquire))
-                    hook(tls_stream);
+                if (tls_observer.created) tls_observer.created(tls_stream);
+                else if (!tls_observer.replace_default_hooks) {
+                    if (auto hook = detail::client_tls_created_for_test.load(
+                            std::memory_order_acquire)) hook(tls_stream);
+                }
 #endif
                 tls_stream.set_hostname(host);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = detail::tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
+                if (tls_observer.setup_entered) tls_observer.setup_entered();
+                else if (!tls_observer.replace_default_hooks) {
+                    if (auto hook = detail::tls_setup_entered_for_test.load(
+                            std::memory_order_acquire)) hook();
+                }
 #endif
                 auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
                 const int tls_error = hs ? 0 : (errno ? errno : EIO);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 if (!hs) {
-                    if (auto hook = detail::client_tls_failed_for_test.load(std::memory_order_acquire))
-                        hook(tls_stream, tls_error);
+                    if (tls_observer.failed) tls_observer.failed(tls_stream, tls_error);
+                    else if (!tls_observer.replace_default_hooks) {
+                        if (auto hook = detail::client_tls_failed_for_test.load(
+                                std::memory_order_acquire)) hook(tls_stream, tls_error);
+                    }
                 }
 #endif
-                if (auto error = stopped_error(client_stage::tls)) {
+                if (auto error = stopped_error(tls_observer.failure_stage)) {
                     tls_stream.shutdown_socket();
                     if (root_released) {
                         co_await tls_stream.abort_and_settle();
@@ -526,7 +553,9 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                     co_return *error;
                 }
                 if (!hs) {
-                    last_error = detail::make_client_error(tls_error, client_stage::tls);
+                    last_error = detail::make_client_error(
+                        tls_error, tls_observer.failure_stage);
+                    handshake_failed = true;
                     if (root_released) {
                         co_await tls_stream.abort_and_settle();
                         tls_session.reset();
@@ -638,8 +667,13 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
     }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     if (auto* stream = std::get_if<net::stream>(&*connected); stream && stream->is_tls()) {
-        if (auto hook = detail::client_tls_ready_for_test.load(std::memory_order_acquire))
-            hook(stream->as_tls());
+        if (tls_observer.ready) tls_observer.ready(stream->as_tls());
+        else if (!tls_observer.replace_default_hooks) {
+            if (auto hook = detail::client_tls_ready_for_test.load(
+                    std::memory_order_acquire)) hook(stream->as_tls());
+        }
+        if (tls_observer.before_publish)
+            co_await tls_observer.before_publish(stream->as_tls());
     }
 #endif
     co_return std::move(*connected);

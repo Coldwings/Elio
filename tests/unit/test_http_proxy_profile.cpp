@@ -34,7 +34,6 @@ TEST_CASE("HTTP proxy profiles own frozen endpoint credentials limits and auth i
 TEST_CASE("HTTP proxy profiles reject unsupported or unsafe endpoint configuration",
           "[http][proxy][profile][issue-1249]") {
     const auto endpoint = GENERATE("", "proxy.example:8080", "http:///", "http://:8080/",
-        "https://proxy.example/",
         "socks5://proxy.example:1080", "http://user:secret@proxy.example/",
         "http://proxy.example/path", "http://proxy.example/?token=value",
         "http://proxy.example/#fragment", "http://proxy.example:0/",

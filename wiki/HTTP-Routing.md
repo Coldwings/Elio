@@ -7,8 +7,9 @@ compatibility key. A redirect creates a fresh plan. Returning a connection does
 not reconstruct a key from the current URL or a replacement Transport.
 
 The current connector implements direct HTTP/HTTPS and one explicitly configured
-plain HTTP proxy: absolute-form forwarding for HTTP origins and CONNECT followed
-by origin TLS for HTTPS origins. HTTPS proxy hops remain a separate feature.
+HTTP or HTTPS proxy: absolute-form forwarding for HTTP origins and CONNECT followed
+by origin TLS for HTTPS origins. HTTPS proxy hops independently authenticate
+the proxy before forwarding or CONNECT.
 
 Malformed target authorities, including an extra unescaped userinfo delimiter,
 fail with `EINVAL` at the `target` stage before any proxy acquisition or CONNECT.
@@ -28,9 +29,9 @@ hashes. They are not persistent identifiers across process restarts.
 | Direct HTTP | Normalized origin host, effective port, HTTP | No TLS layer | Implemented |
 | Direct HTTPS | Normalized origin host, effective port, HTTPS | Origin TLS security domain | Implemented |
 | HTTP origin through plain HTTP proxy | Conservative per-origin binding | Ordered proxy endpoint(s), proxy authentication domain, hop protocol/DNS semantics | Implemented |
-| HTTP origin through HTTPS proxy | Conservative per-origin binding | Plain-proxy fields plus outer proxy TLS security domain | Identity modeled; connector pending |
+| HTTP origin through HTTPS proxy | Conservative per-origin binding | Plain-proxy fields plus outer proxy TLS security domain | Implemented |
 | HTTPS origin through plain HTTP CONNECT | Permanently target-bound tunnel | Ordered proxy endpoint(s), proxy authentication domain, origin TLS security domain | Implemented |
-| HTTPS origin through HTTPS CONNECT | Permanently target-bound tunnel | Plain-CONNECT fields plus independent outer proxy TLS security domain | Identity modeled; connector pending |
+| HTTPS origin through HTTPS CONNECT | Permanently target-bound tunnel | Plain-CONNECT fields plus independent outer proxy TLS security domain | Implemented |
 
 Forward channels retain origin authority in their key for now, even though a
 future connector may deliberately allow sharing across compatible HTTP origins.
@@ -39,7 +40,7 @@ also remains separate from proxy endpoints for HTTP request encoding/accounting.
 Local versus proxy target-DNS semantics have distinct identity values; SOCKS and
 HTTP/2 connector implementations remain outside this change.
 
-## Explicit Plain HTTP Proxy
+## Explicit HTTP and HTTPS Proxy
 
 ```cpp
 elio::http::transport_config config;
@@ -55,7 +56,8 @@ auto result = co_await client.get_result("https://origin.example/path");
 ```
 
 An absent `proxy` preserves direct routing. The endpoint must be an explicit
-`http://host[:port]` authority, optionally ending in `/`. URI userinfo, other
+`http://host[:port]` or `https://host[:port]` authority, optionally ending in `/`.
+The schemes select plaintext/TLS, not port-number guessing. URI userinfo, other
 paths, query, fragment, unsupported schemes and unbounded configuration are
 rejected during construction. There is no environment-variable discovery, PAC,
 SOCKS, chain of proxies, HTTP/2 proxy mode or automatic authentication replay.
@@ -118,11 +120,70 @@ EOF. A CONNECT 407 is `EACCES`, other rejected final statuses are
 error at `proxy_connect`. No rejected channel is pooled or automatically
 replayed. A forwarding 407 remains an ordinary HTTP response.
 
-After local proxy DNS, one `connect_timeout` budget covers proxy TCP, CONNECT and
-origin TLS without restarting at either transition. When configured, the same
+After local proxy DNS, one `connect_timeout` budget covers proxy TCP, proxy TLS
+when selected, CONNECT and origin TLS without restarting at any transition. When configured, the same
 absolute `acquisition_timeout` also covers queueing and proxy DNS. Request/body
 I/O keeps its existing response deadline. Layered I/O cancellation/timing uses
 the owned protocol chain rather than bypassing it through a root descriptor.
+
+## HTTPS Proxy Security And Composition
+
+```cpp
+config.proxy->endpoint = "https://proxy.example:8443";
+config.proxy->verify_certificate = true; // independent default: true
+config.proxy->configure_tls = [](elio::http::transport_tls_config& policy) {
+    if (!policy.load_verify_locations("proxy-ca.pem"))
+        throw std::runtime_error("Proxy trust initialization failed");
+};
+config.configure_tls = [](elio::http::transport_tls_config& policy) {
+    if (!policy.load_verify_locations("origin-ca.pem"))
+        throw std::runtime_error("Origin trust initialization failed");
+};
+```
+
+The existing Transport verification flag and `configure_tls` remain origin-only.
+The proxy callback uses the same construction-only builder, but publishes a
+separate TLS context. Trust stores, client certificates/keys, reference names,
+SNI, ALPN and session state are not shared between layers. A trusted proxy does
+not authenticate the origin. Numeric proxy and origin references require IP
+SANs and send no SNI; DNS references use their independently decoded names.
+Disable verification only in the intended domain; neither flag changes the other.
+Proxy TLS callbacks are not invoked for plain HTTP proxy endpoints.
+
+The proxy layer advertises `http/1.1` by default. Its builder accepts only that
+protocol or an empty ALPN list; other lists return false without changing the
+previous policy. Outer HTTP/2 CONNECT is not implemented. Nonempty selected
+ALPN other than HTTP/1.1 is rejected in the corresponding TLS stage. Failures
+at outer handshake are `proxy_tls`; CONNECT errors remain `proxy_connect`,
+and origin handshake errors remain `tls`. Existing stage numbers are unchanged.
+
+HTTP forwarding uses HTTP -> TLS(proxy) -> owned TCP root. HTTPS uses HTTP ->
+TLS(origin) -> owned CONNECT prefix -> TLS(proxy) -> owned TCP root. Both TLS
+layers use the same generic implementation and exclusively drive their next
+layer. Forwarded HTTP watchdogs still use the outer proxy TLS stream's exposed
+descriptor. Only tunneled HTTPS uses descriptor-free route-operation watchdogs
+for inner HTTP I/O; nested TLS and prefix I/O never bypass the owned chain
+through the root descriptor. Buffered outer plaintext is available without
+waiting for new TCP readiness.
+
+The two custom output BIOs each retain at most the default 1 MiB ciphertext
+payload, so their aggregate retained output payload is at most 2 MiB, plus the
+configured CONNECT prefix (default 8 KiB). This is not a total-memory limit:
+borrowed application payload, TLS/OpenSSL/control allocations, parser storage
+and kernel socket buffers are separate. Backpressure and submitted-storage
+ownership apply recursively until each lower operation completes.
+
+Inner `finish_write` is layer-local: TLS 1.3 closes its write direction and TLS
+1.2 uses its whole-session rules without pretending to close the outer TLS
+protocol. Whole-stack abort seals and settles the owned chain. EOF remains a
+TLS result at the layer where it occurs; raw EOF is not an authenticated alert.
+An inner failure or finish never recovers a pre-CONNECT outer HTTP connection
+for forwarding or another target. HTTP Transport retires closed sessions.
+
+Idle reuse requires quiescence of every TLS and prefix layer: no retained lower
+frame, active/pending output, sealed channel or unread CONNECT prefix. Root
+accounting is installed before outer handshake and remains alive through
+failed setup, whole-chain abort and inactive-but-retained output frames.
 
 ## Normalization And Policy Ownership
 
@@ -289,7 +350,8 @@ one absolute steady-clock deadline on acquisition entry, before queueing. The
 same deadline bounds the queue, DNS observer, TCP retries, CONNECT and TLS handshake;
 stage transitions and retries never restart it. It applies independently of
 whether finite limits are enabled. Timeout errors retain the active stage:
-`acquire` for queue expiry, `resolve` for DNS, and `connect`/`proxy_connect`/`tls` for setup.
+`acquire` for queue expiry, `resolve` for DNS, and
+`connect`/`proxy_tls`/`proxy_connect`/`tls` for setup.
 
 The independent `dns_timeout` cap may shorten the DNS portion.
 `client_config::connect_timeout` starts after DNS and is intersected with the

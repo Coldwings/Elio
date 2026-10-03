@@ -178,12 +178,28 @@ public:
         output_retired_ = true;
     }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+    struct output_test_state {
+        size_t budget;
+        size_t retained;
+        size_t pending;
+        uint64_t accepted;
+        uint64_t drained;
+        int error;
+        bool pump_active;
+    };
+
     void* read_publish_context = nullptr;
     void (*before_read_publish)(void*) = nullptr;
     void* output_progress_context = nullptr;
     coro::task<void> (*after_output_progress)(void*, uint64_t) = nullptr;
     coro::task<void> (*after_output_inactive)(void*, uint64_t) = nullptr;
     bool output_active_for_test() const noexcept { return pump_active_; }
+    output_test_state output_state_for_test() noexcept {
+        std::lock_guard lock(mutex);
+        return {output.budget(), output.retained_bytes(), output.pending_bytes(),
+                output.accepted_bytes(), output.drained_bytes(), output.error(),
+                pump_active_};
+    }
     void set_output_active_for_test(bool active) noexcept {
         std::lock_guard lock(mutex);
         pump_active_ = active;

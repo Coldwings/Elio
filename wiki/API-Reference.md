@@ -3091,8 +3091,8 @@ HTTP/1 connection establishment and idle pooling now consume one internal
 immutable route plan per exchange. Its structured key compares normalized
 origin authority, route mode, ordered proxy-hop identities, security/authentication
 domains, protocol requirements, and connector/resolution domains by full value
-equality. Direct routes and one explicit plain HTTP proxy are implemented;
-HTTPS proxy hops remain separate. Redirects create fresh plans, and returns retain the
+equality. Direct routes and one explicit HTTP/HTTPS proxy are implemented.
+Proxy and origin TLS security domains remain independent. Redirects create fresh plans, and returns retain the
 acquisition plan. See [[HTTP Routing]] (`HTTP-Routing.md`) for the compatibility
 matrix, normalization, and standalone-pool responsibility boundary.
 
@@ -3111,9 +3111,11 @@ struct proxy_connect_limits {
     size_t max_read_ahead = 8192;
 };
 struct http_proxy_config {
-    std::string endpoint; // explicit plain http://host[:port] authority
+    std::string endpoint; // explicit http[s]://host[:port] authority
     std::optional<proxy_basic_credentials> basic_auth;
     proxy_connect_limits connect_limits;
+    bool verify_certificate = true; // proxy TLS only
+    std::function<void(transport_tls_config&)> configure_tls; // proxy TLS only
 };
 ```
 
@@ -3134,7 +3136,10 @@ Direct-route caller CONNECT handling and public request serialization are unchan
 the credential-header migration below still applies to direct requests.
 To migrate custom proxy
 headers, configure `proxy.basic_auth`; public request serialization remains
-unchanged. HTTPS proxy, SOCKS, chained proxy and HTTP/2 routes are not supported.
+unchanged. HTTPS proxy uses a separate construction-only TLS policy; existing
+Transport TLS options remain origin-only. The proxy builder accepts `http/1.1`
+or no ALPN, and rejects other lists unchanged. SOCKS, chained proxy and HTTP/2
+routes are not supported.
 Standalone `connection_pool` remains direct-only and rejects construction with
 an explicit proxy option (`std::invalid_argument`) rather than ignoring it.
 Full encoding, zero-bound, error and ownership rules are in [[HTTP Routing]].
@@ -3151,7 +3156,8 @@ an empty optional plus `errno`. Capture that legacy errno immediately.
 
 ```cpp
 enum class client_stage {
-    target, resolve, acquire, connect, tls, request, headers, body, framing, proxy_connect
+    target, resolve, acquire, connect, tls, request, headers, body, framing,
+    proxy_connect, proxy_tls
 };
 struct client_error {
     std::error_code code;
@@ -3181,6 +3187,7 @@ changes. This is not a promise that existing debug logging redacts requests.
 | `connect` | TCP connection failure, cancellation, or connect deadline |
 | `tls` | TLS context validation, handshake failure/cancellation/deadline |
 | `proxy_connect` | CONNECT negotiation, status rejection, framing/size bound, cancellation or setup deadline |
+| `proxy_tls` | Independent outer proxy TLS authentication, ALPN, cancellation or setup deadline |
 | `request` | Request/header validation, serialization, or request write failure/cancellation/deadline |
 | `headers` | Transport failure, cancellation, or deadline before final headers complete |
 | `body` | Transport failure, cancellation, or deadline after headers; aggregate body limit (`EMSGSIZE`) |

@@ -7,7 +7,8 @@
 namespace elio::http {
 
 enum class client_stage {
-    target, resolve, acquire, connect, tls, request, headers, body, framing
+    target, resolve, acquire, connect, tls, request, headers, body, framing,
+    proxy_connect
 };
 
 /// Owned, bounded metadata: no URLs, credentials, diagnostics, or views.

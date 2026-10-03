@@ -3,7 +3,7 @@
 `<elio/net/byte_stream.hpp>` defines the TLS-free C++20
 `net::publishing_byte_stream` concept and its explicit semantic opt-in tag,
 `net::publishing_byte_stream_contract`. It is an ownership and lifecycle
-boundary for future TLS, buffered-channel, and HTTP Transport adapters, not an
+boundary for TLS, buffered-channel, and HTTP Transport adapters, not an
 arbitrary `read`/`write` duck type.
 
 This foundation supplies a contract and syntax checks, not every adapter.
@@ -145,5 +145,7 @@ Every adapter must add scripted short-progress, nonempty-write zero-progress,
 ordered read-ahead, EOF-scope, publication, completion/cancellation-race, and
 overlapping-abort regressions.
 Use barriers or test hooks where feasible rather than sleeps. Concept syntax
-checks alone do not validate these runtime requirements. Generic TLS and HTTP
-Transport implementations remain separate work following this foundation.
+checks alone do not validate these runtime requirements. HTTP Transport CONNECT
+uses an internal owned prefix adapter with the same lower
+publication/EOF/abort rules; it does not opt the closed public `net::stream`
+facade into this concept. See [[HTTP Routing]] for setup bounds and lifecycle.

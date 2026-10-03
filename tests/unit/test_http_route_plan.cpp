@@ -112,6 +112,8 @@ TEST_CASE("HTTP route identity normalizes authorities without retaining URL secr
     REQUIRE(first.key() == second.key());
     REQUIRE(connection_key_hash{}(first.key()) == connection_key_hash{}(second.key()));
     REQUIRE(first.target().authority() == "example.test:80");
+    REQUIRE(first.wire_target().authority() == "EXAMPLE.test:80");
+    REQUIRE(second.wire_target().authority() == "example.test:80");
     REQUIRE(first.key() != plan_for("https://example.test/", policy).key());
     REQUIRE(first.key() != plan_for("http://example.test:81/", policy).key());
     REQUIRE(first.key() != plan_for("http://example.test./", policy).key());
@@ -119,6 +121,7 @@ TEST_CASE("HTTP route identity normalizes authorities without retaining URL secr
     const auto v6 = plan_for("https://[2001:0DB8:0:0:0:0:0:1]:443/a", policy);
     REQUIRE(v6.key() == plan_for("https://[2001:db8::1]/b", policy).key());
     REQUIRE(v6.target().authority() == "[2001:db8::1]:443");
+    REQUIRE(v6.wire_target().authority() == "[2001:0DB8:0:0:0:0:0:1]:443");
     REQUIRE(route_endpoint::from("fe80:0:0:0:0:0:0:1%ethA", 80) ==
             route_endpoint::from("fe80::1%ethA", 80));
     REQUIRE(route_endpoint::from("fe80::1%ethA", 80) !=

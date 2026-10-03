@@ -38,6 +38,8 @@
 
 namespace elio::tls {
 
+namespace detail { struct tls_idle_access; }
+
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
 enum class tls_test_operation { read, write };
@@ -125,6 +127,7 @@ int lower_fd_or_negative(const Lower& lower) noexcept {
 template<typename Lower = net::tcp_stream>
 requires detail::tls_lower_stream<Lower>
 class basic_tls_stream {
+    friend struct detail::tls_idle_access;
 public:
     using byte_stream_contract = net::publishing_byte_stream_contract;
 
@@ -135,6 +138,14 @@ public:
     void set_output_test_hooks(detail::output_bio_state::test_hooks hooks) {
         auto lock = lock_ssl_state();
         transport_->output.set_test_hooks(hooks);
+    }
+    void set_output_progress_test_hook(void* context,
+            coro::task<void> (*hook)(void*, uint64_t),
+            coro::task<void> (*inactive_hook)(void*, uint64_t) = nullptr) {
+        auto lock = lock_ssl_state();
+        transport_->output_progress_context = context;
+        transport_->after_output_progress = hook;
+        transport_->after_output_inactive = inactive_hook;
     }
     detail::tls_shutdown_test_state shutdown_state_for_test() const {
         auto lock = lock_ssl_state();
@@ -1317,6 +1328,27 @@ private:
     std::atomic<bool> externally_shut_down_{false};
     std::string hostname_;  // Store hostname for SNI and verification
 };
+
+namespace detail {
+
+// Internal pooling snapshot, not a general concurrent-operation guarantee.
+// The caller has already settled its public TLS operations and holds exclusive
+// session ownership. Any remaining transport reference can still retain an
+// output/lower frame even after its drained watermark has been reported.
+struct tls_idle_access {
+    template<typename Lower>
+    static bool is_quiescent(const basic_tls_stream<Lower>& stream) noexcept {
+        if (!stream.transport_) return false;
+        auto lock = stream.lock_ssl_state();
+        return stream.transport_.use_count() == 1 && !stream.transport_->pump_active_ &&
+            stream.transport_->output.pending().empty() &&
+            !stream.transport_->operation_error() && !stream.write_pending_ &&
+            !stream.write_retry_exclusive_ && !stream.close_.whole &&
+            !stream.close_.write_closed && !stream.close_.peer_closed;
+    }
+};
+
+} // namespace detail
 
 class tls_stream : public basic_tls_stream<net::tcp_stream> {
 public:

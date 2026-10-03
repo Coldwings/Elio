@@ -215,6 +215,10 @@ if(TARGET elio_http)
     add_executable(http_client_result http_client_result.cpp)
     target_link_libraries(http_client_result PRIVATE elio_http)
     target_link_options(http_client_result PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(http_proxy http_proxy.cpp)
+    target_link_libraries(http_proxy PRIVATE elio_http)
+    target_link_options(http_proxy PRIVATE ${STATIC_LINK_FLAGS})
     if(ELIO_BUILD_TESTS)
         add_test(NAME http_client_result_example COMMAND http_client_result)
         set_tests_properties(http_client_result_example PROPERTIES TIMEOUT 30

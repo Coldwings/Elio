@@ -8,6 +8,9 @@
 #include <elio/http/client_base.hpp>
 #include <elio/http/detail/route_plan.hpp>
 #include <elio/http/detail/bounded_pool.hpp>
+#include <elio/http/detail/proxy_connector.hpp>
+#include <elio/http/detail/request_wire.hpp>
+#include <elio/http/detail/route_idle_pool.hpp>
 #include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
@@ -44,6 +47,8 @@ namespace detail {
 using route_connect_hook = coro::task<client_result<net::stream>> (*)(
     const route_plan&, std::chrono::nanoseconds, coro::cancel_token);
 inline std::atomic<route_connect_hook> route_connect_for_test{nullptr};
+using route_channel_hook = coro::task<client_result<route_connection>> (*)(const route_plan&);
+inline std::atomic<route_channel_hook> route_channel_for_test{nullptr};
 using route_deadline_hook = void (*)(std::optional<std::chrono::steady_clock::time_point>);
 inline std::atomic<route_deadline_hook> route_deadline_for_test{nullptr};
 using acquisition_now_hook = std::chrono::steady_clock::time_point (*)() noexcept;
@@ -53,6 +58,7 @@ using lease_disposition_hook = void (*)(int, bool);
 inline std::atomic<lease_disposition_hook> lease_disposition_for_test{nullptr};
 using lease_return_hook = void (*)();
 inline std::atomic<lease_return_hook> lease_before_return_for_test{nullptr};
+inline std::atomic<lease_return_hook> lease_after_publish_for_test{nullptr};
 inline std::atomic<lease_return_hook> transport_clear_visible_for_test{nullptr};
 // Expire only the Expect clock after final headers, allowing a regression to
 // hold the final body behind a barrier without relying on timer scheduling.
@@ -69,6 +75,8 @@ inline std::atomic<response_deadline_hook> response_deadline_for_test{nullptr};
 using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token, client_stage);
 inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> response_watchdog_before_start_for_test{nullptr};
+inline std::atomic<void (*)()> response_watchdog_operation_entered_for_test{nullptr};
 inline std::atomic<void(*)()> response_watchdog_construct_for_test{nullptr};
 inline std::atomic<void(*)(int)> deferred_upload_for_test{nullptr};
 using deferred_upload_result_hook = coro::task<void> (*)(const std::optional<client_error>&);
@@ -93,7 +101,8 @@ struct client_config : base_client_config {
     size_t max_connections_per_host = 6;          ///< Max connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
     std::optional<pool_limits> limits;             ///< Opt-in finite Transport admission
-    std::chrono::nanoseconds acquisition_timeout{0}; ///< Queue + DNS + TCP + TLS; <=0 disables
+    std::chrono::nanoseconds acquisition_timeout{0}; ///< Queue + DNS + full route setup; <=0 disables
+    std::optional<http_proxy_config> proxy;         ///< Explicit frozen HTTP proxy; no environment discovery
     /// Buffered APIs cap the accumulated final body and, separately, the
     /// cumulative informational wire bytes. with_response uses its own options
     /// for these limits and never allocates a body-sized receive buffer.
@@ -181,6 +190,7 @@ struct transport_config {
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
     std::optional<pool_limits> limits;             ///< Absent preserves legacy admission
     std::chrono::nanoseconds acquisition_timeout{0}; ///< One absolute acquisition budget
+    std::optional<http_proxy_config> proxy;         ///< Plain HTTP forward/CONNECT hop
     /// Optional construction-time TLS customization. It runs after Elio's
     /// default client TLS initialization on a builder that is moved into the
     /// transport only after this callback returns.
@@ -197,7 +207,8 @@ struct transport_config {
         , max_connections_per_host(config.max_connections_per_host)
         , pool_idle_timeout(config.pool_idle_timeout)
         , limits(config.limits)
-        , acquisition_timeout(config.acquisition_timeout) {}
+        , acquisition_timeout(config.acquisition_timeout)
+        , proxy(config.proxy) {}
 };
 
 /// Connection wrapper using unified net::stream
@@ -226,7 +237,10 @@ public:
     };
 
     explicit connection_pool(transport_config config = {})
-        : config_(config) {}
+        : config_(std::move(config)) {
+        if (config_.proxy)
+            throw std::invalid_argument("Explicit proxy routes require an HTTP Transport");
+    }
 
     explicit connection_pool(const client_config& config)
         : connection_pool(transport_config(config)) {}
@@ -391,7 +405,7 @@ private:
         if (auto hook = detail::route_connect_for_test.load(std::memory_order_acquire))
             co_return co_await hook(plan, connect_timeout, std::move(token));
 #endif
-        // Identity is modeled now; proxy connectors are delivered separately.
+        // Standalone legacy pool adapters intentionally remain direct-only.
         if (plan.key().mode != detail::route_mode::direct || !plan.key().hops.empty() ||
             plan.key().protocol != detail::route_protocol::http1 ||
             plan.key().target_dns != detail::route_dns_mode::local)
@@ -425,8 +439,9 @@ private:
     friend class client;
     struct state {
         explicit state(transport_config value)
-            : config(std::move(value)), snapshot(make_route_snapshot(config)), pool(config),
-              admission(config.limits ? std::make_unique<detail::bounded_pool<connection>>(
+            : config(std::move(value)), snapshot(make_route_snapshot(config)),
+              idle(config.max_connections_per_host, config.pool_idle_timeout),
+              admission(config.limits ? std::make_unique<detail::bounded_pool<detail::route_connection>>(
                   *config.limits, config.pool_idle_timeout) : nullptr) {
             settled.set();
         }
@@ -444,8 +459,8 @@ private:
         // The snapshot outlives idle stream destruction, including TLS state.
         const transport_config config;
         const std::shared_ptr<const detail::route_snapshot> snapshot;
-        connection_pool pool;
-        std::unique_ptr<detail::bounded_pool<connection>> admission;
+        detail::route_idle_pool<detail::route_connection> idle;
+        std::unique_ptr<detail::bounded_pool<detail::route_connection>> admission;
         mutable std::mutex mutex;
         sync::event settled;
         size_t active_operations = 0;
@@ -457,29 +472,53 @@ private:
     public:
         operation_lease() noexcept = default;
         operation_lease(operation_lease&& other) noexcept
-            : owner_(std::move(other.owner_)), generation_(other.generation_) {}
+            : owner_(std::move(other.owner_)), retirement_owner_(std::move(other.retirement_owner_)),
+              generation_(other.generation_), registered_(std::exchange(other.registered_, false)) {}
         operation_lease& operator=(operation_lease&& other) noexcept {
             if (this != &other) {
-                reset();
+                finish();
                 owner_ = std::move(other.owner_);
+                retirement_owner_ = std::move(other.retirement_owner_);
                 generation_ = other.generation_;
+                registered_ = std::exchange(other.registered_, false);
             }
             return *this;
         }
         operation_lease(const operation_lease&) = delete;
         operation_lease& operator=(const operation_lease&) = delete;
-        ~operation_lease() { reset(); }
+        ~operation_lease() { finish(); }
         operation_lease(std::shared_ptr<state> owner, uint64_t generation) noexcept
-            : owner_(std::move(owner)), generation_(generation) {}
-        void reset() noexcept {
-            if (auto owner = std::move(owner_)) owner->finish_operation();
-        }
+            : owner_(owner), retirement_owner_(std::move(owner)), generation_(generation),
+              registered_(true) {}
+        void reset() noexcept { finish(); }
+        void handoff_to_root_locked() noexcept { owner_.reset(); }
         const std::shared_ptr<state>& owner() const noexcept { return owner_; }
         uint64_t generation() const noexcept { return generation_; }
 
     private:
+        void finish() noexcept {
+            auto owner = retirement_owner_.lock();
+            if (!owner) {
+                owner_.reset();
+                registered_ = false;
+                return;
+            }
+            bool notify = false;
+            {
+                std::lock_guard lock(owner->mutex);
+                owner_.reset();
+                if (registered_) {
+                    registered_ = false;
+                    if (owner->active_operations != 0)
+                        notify = --owner->active_operations == 0;
+                }
+            }
+            if (notify) owner->settled.set();
+        }
         std::shared_ptr<state> owner_;
+        std::weak_ptr<state> retirement_owner_;
         uint64_t generation_ = 0;
+        bool registered_ = false;
     };
 
     class connection_lease {
@@ -503,16 +542,23 @@ private:
         connection_lease& operator=(const connection_lease&) = delete;
         ~connection_lease() { retire(); }
 
-        connection& stream() noexcept { return conn_; }
+        detail::route_connection& stream() noexcept { return conn_; }
         const detail::route_plan& plan() const noexcept { return plan_; }
         void retire() noexcept {
             if (disposition_ != disposition::active) return;
             const int fd = conn_.fd();
             disposition_ = disposition::retired;
+            const auto anchor = conn_.retirement_anchor();
+            // A failed idle publication may have cleared this slot. Terminal
+            // retirement keeps the current operation alive with the root.
+            if (anchor) anchor->operation = operation_;
             detail::abort_stream_io(conn_);
+            const bool deferred = static_cast<bool>(anchor);
+            detail::defer_stream_retirement(conn_, capacity_);
             conn_.disconnect();
             capacity_.reset();
             observe_disposition(fd, false);
+            if (!deferred) operation_->reset();
             operation_.reset();
         }
 
@@ -521,41 +567,58 @@ private:
         friend class client;
         enum class disposition { empty, active, returned, retired };
 
-        connection_lease(operation_lease operation, detail::route_plan plan,
-                         connection conn,
-                         detail::bounded_pool<connection>::permit capacity = {}) noexcept
+        connection_lease(std::shared_ptr<operation_lease> operation, detail::route_plan plan,
+                         detail::route_connection conn,
+                         detail::bounded_pool<detail::route_connection>::permit capacity = {}) noexcept
             : operation_(std::move(operation)), plan_(std::move(plan)),
-              conn_(std::move(conn)), capacity_(std::move(capacity)) {}
+              conn_(std::move(conn)), capacity_(std::move(capacity)) {
+            if (auto anchor = conn_.retirement_anchor()) anchor->operation = operation_;
+        }
 
         // Only the exchange owner may call this after validating completion.
         // No public boolean can bypass the response framing and I/O settlement.
         void return_reusable() {
             if (disposition_ != disposition::active) return;
+            // HTTP framing does not settle TLS control/output work. Retire a
+            // tunnel whose owned transport still has a pump/lower frame.
+            if (!conn_.io_quiescent()) {
+                retire();
+                return;
+            }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (auto hook = detail::lease_before_return_for_test.load()) hook();
 #endif
-            const auto owner = operation_.owner();
+            const auto owner = operation_->owner();
+            const auto anchor = conn_.retirement_anchor();
             bool retained = false;
             const int fd = conn_.fd();
-            std::optional<detail::bounded_pool<connection>::change> admission_change;
+            std::optional<detail::bounded_pool<detail::route_connection>::change> admission_change;
             {
                 // clear/shutdown publish their boundary under this lock, so a
                 // late insertion cannot escape it. Stream cleanup runs outside.
                 std::lock_guard lock(owner->mutex);
-                if (!owner->closing && operation_.generation() == owner->generation) {
+                if (!owner->closing && operation_->generation() == owner->generation) {
+                    // Keep the preallocated operation token in the idle root.
                     if (owner->admission) {
                         admission_change.emplace(owner->admission->retain(capacity_, conn_));
                         retained = admission_change->retained;
-                    } else retained = owner->pool.retain_key(plan_.key(), conn_);
+                    } else retained = owner->idle.retain(plan_.key(), conn_);
+                    // The root remains shutdown-visible while idle, but its
+                    // state edge must be weak because state owns the pool.
+                    if (retained && anchor) operation_->handoff_to_root_locked();
                 }
             }
             if (!retained) {
                 retire();
                 return;
             }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::lease_after_publish_for_test.load()) hook();
+#endif
             disposition_ = disposition::returned;
             conn_.disconnect();
             observe_disposition(fd, true);
+            if (!anchor) operation_->reset();
             operation_.reset();
         }
 
@@ -569,10 +632,10 @@ private:
         }
 
         // Retirement closes the stream before settlement releases the owner.
-        operation_lease operation_;
+        std::shared_ptr<operation_lease> operation_;
         detail::route_plan plan_;
-        connection conn_;
-        detail::bounded_pool<connection>::permit capacity_;
+        detail::route_connection conn_;
+        detail::bounded_pool<detail::route_connection>::permit capacity_;
         disposition disposition_ = disposition::active;
     };
 
@@ -590,12 +653,12 @@ public:
     /// Drop idle entries and reject later returns of pre-clear leases. Existing
     /// I/O continues; use shutdown() to stop new acquisitions and await settlement.
     void clear() {
-        connection_pool::retired_pools retired;
-        std::optional<detail::bounded_pool<connection>::change> admission_change;
+        detail::route_idle_pool<detail::route_connection>::detached retired;
+        std::optional<detail::bounded_pool<detail::route_connection>::change> admission_change;
         {
             std::lock_guard lock(state_->mutex);
             state_->generation = detail::new_route_domain();
-            retired = state_->pool.detach_idle();
+            retired = state_->idle.detach();
             if (state_->admission) admission_change.emplace(state_->admission->clear());
         }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -608,12 +671,12 @@ public:
     coro::task<coro::cancel_result> shutdown(coro::cancel_token token = {}) {
         const auto owner = state_;
         {
-            connection_pool::retired_pools retired;
-            std::optional<detail::bounded_pool<connection>::change> admission_change;
+            detail::route_idle_pool<detail::route_connection>::detached retired;
+            std::optional<detail::bounded_pool<detail::route_connection>::change> admission_change;
             {
                 std::lock_guard lock(owner->mutex);
                 owner->closing = true;
-                retired = owner->pool.detach_idle();
+                retired = owner->idle.detach();
                 if (owner->admission) admission_change.emplace(owner->admission->clear(true));
             }
         }
@@ -669,14 +732,16 @@ public:
     coro::task<client_result<connection>> acquire_result_for_test(
             const url& target, std::chrono::nanoseconds connect_timeout,
             coro::cancel_token token = {}) {
-        if (state_->admission)
+        if (state_->admission || state_->snapshot->proxy)
             co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         auto result = co_await acquire_leased_result(target, connect_timeout, std::move(token));
         if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
         auto lease = std::move(std::get<connection_lease>(result));
         // Historical test adapter only; production exchanges cannot detach I/O.
+        auto legacy = lease.stream().take_legacy();
+        if (!legacy) co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         lease.disposition_ = connection_lease::disposition::empty;
-        co_return std::move(lease.stream());
+        co_return std::move(*legacy);
     }
 #endif
 
@@ -694,6 +759,11 @@ private:
         snapshot.dns_timeout = config.dns_timeout;
         snapshot.dns_domain = config.dns_domain;
         snapshot.origin_tls = std::make_shared<tls::tls_context>(make_tls_context(config));
+        if (config.proxy) {
+            snapshot.proxy = detail::freeze_proxy_profile(*config.proxy);
+            snapshot.hops.push_back({snapshot.proxy->endpoint, 0, snapshot.proxy->auth_domain});
+            snapshot.target_dns = detail::route_dns_mode::proxy;
+        }
         return std::make_shared<const detail::route_snapshot>(std::move(snapshot));
     }
     static std::optional<operation_lease> try_acquire_lease(const std::shared_ptr<state>& owner) {
@@ -713,6 +783,7 @@ private:
             coro::cancel_token token) {
         auto lease = try_acquire_lease(owner);
         if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
+        auto operation = std::make_shared<operation_lease>(std::move(*lease));
         std::optional<std::chrono::steady_clock::time_point> deadline;
         if (owner->config.acquisition_timeout.count() > 0) {
             const auto now = detail::acquisition_now();
@@ -721,28 +792,81 @@ private:
                 ? std::chrono::steady_clock::time_point::max()
                 : now + owner->config.acquisition_timeout;
         }
-        detail::bounded_pool<connection>::permit capacity;
+        detail::bounded_pool<detail::route_connection>::permit capacity;
         if (owner->admission) {
             auto admitted = co_await owner->admission->acquire(plan.key(), deadline, token);
             if (const auto* error = std::get_if<client_error>(&admitted)) co_return *error;
-            auto granted = std::move(std::get<detail::bounded_pool<connection>::grant>(admitted));
+            auto granted = std::move(std::get<detail::bounded_pool<detail::route_connection>::grant>(admitted));
             capacity = std::move(granted.capacity);
+            if (granted.idle) {
+                connection_lease selected(operation, std::move(plan),
+                    std::move(*granted.idle), std::move(capacity));
+                if (token.is_cancelled())
+                    co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+                if (deadline && *deadline <= detail::acquisition_now())
+                    co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
+                co_return selected;
+            }
             if (token.is_cancelled())
                 co_return detail::make_client_error(ECANCELED, client_stage::acquire);
             if (deadline && *deadline <= detail::acquisition_now())
                 co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
-            if (granted.idle)
-                co_return connection_lease(std::move(*lease), std::move(plan),
-                    std::move(*granted.idle), std::move(capacity));
+        } else {
+            if (token.is_cancelled())
+                co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+            if (deadline && *deadline <= detail::acquisition_now())
+                co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
+            if (auto idle = owner->idle.take(plan.key())) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::idle_taken_for_test.load(std::memory_order_acquire)) hook();
+#endif
+                connection_lease selected(operation, std::move(plan), std::move(*idle));
+                if (token.is_cancelled())
+                    co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+                if (deadline && *deadline <= detail::acquisition_now())
+                    co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
+                co_return selected;
+            }
         }
-        auto acquisition = owner->admission
-            ? owner->pool.connect_plan(plan, connect_timeout, token, deadline)
-            : owner->pool.acquire_plan(plan, connect_timeout, token, deadline);
-        auto conn_result = co_await std::move(acquisition);
+        auto conn_result = co_await connect_owned_plan(plan, connect_timeout, token, deadline,
+                                                      capacity, operation);
         capacity.dial_complete();
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
-        co_return connection_lease(std::move(*lease), std::move(plan),
-            std::move(std::get<connection>(conn_result)), std::move(capacity));
+        co_return connection_lease(std::move(operation), std::move(plan),
+            std::move(std::get<detail::route_connection>(conn_result)), std::move(capacity));
+    }
+
+    static coro::task<client_result<detail::route_connection>> connect_owned_plan(
+            const detail::route_plan& plan, std::chrono::nanoseconds timeout,
+            coro::cancel_token token,
+            std::optional<std::chrono::steady_clock::time_point> deadline,
+            detail::bounded_pool<detail::route_connection>::permit& capacity,
+            const std::shared_ptr<operation_lease>& operation) {
+        if (token.is_cancelled())
+            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = detail::route_deadline_for_test.load(std::memory_order_acquire)) hook(deadline);
+        if (auto hook = detail::route_channel_for_test.load(std::memory_order_acquire))
+            co_return co_await hook(plan);
+        if (auto hook = detail::route_connect_for_test.load(std::memory_order_acquire)) {
+            auto result = co_await hook(plan, timeout, token);
+            if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
+            co_return detail::route_connection(std::move(std::get<connection>(result)));
+        }
+#endif
+        if (plan.snapshot().proxy)
+            co_return co_await detail::connect_proxy_route(plan, timeout, token, deadline, capacity, operation);
+        if (plan.key().mode != detail::route_mode::direct || !plan.key().hops.empty() ||
+            plan.key().protocol != detail::route_protocol::http1 ||
+            plan.key().target_dns != detail::route_dns_mode::local)
+            co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
+        const auto& snapshot = plan.snapshot();
+        auto result = co_await detail::client_connect_result_impl(plan.target().host, plan.target().port,
+            plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
+            snapshot.rotate_resolved_addresses, timeout, token,
+            snapshot.dns_timeout, snapshot.dns_domain, deadline, true);
+        if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
+        co_return detail::route_connection(std::move(std::get<connection>(result)));
     }
 
     const std::shared_ptr<state> state_;
@@ -931,7 +1055,8 @@ private:
         }
 
         auto parsed = url::parse(url_str);
-        if (!parsed) {
+        if (!parsed || (transport_->config().proxy &&
+                        !detail::valid_proxy_uri_authority(url_str, *parsed))) {
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
         if (!detail::is_supported_http_url_scheme(parsed->scheme)) {
@@ -996,7 +1121,7 @@ private:
     /// the fd to abort an in-flight write on timeout. Returns an owned error
     /// on failure and an empty optional on success.
     static coro::task<std::optional<client_error>>
-    write_request_data(connection& conn, std::string_view data,
+    write_request_data(detail::route_connection& conn, std::string_view data,
                        const url& target,
                        std::chrono::nanoseconds io_deadline,
                        bool deadline_enforced,
@@ -1008,7 +1133,17 @@ private:
             write_result = hook(data);
         } else
 #endif
-        if (deadline_enforced) {
+        if (deadline_enforced && conn.fd() < 0) {
+            auto result = co_await detail::await_route_operation<io::io_result>(
+                [&](coro::cancel_token stopped) { return conn.write_all(data, std::move(stopped)); },
+                token, std::chrono::steady_clock::now() + io_deadline);
+            write_result = result.value;
+            if (result.timed_out) {
+                conn.shutdown_socket();
+                co_await conn.abort_and_settle();
+                co_return detail::make_client_error(ETIMEDOUT, client_stage::request);
+            }
+        } else if (deadline_enforced) {
             auto timed_out = std::make_shared<std::atomic<bool>>(false);
             write_result = co_await detail::await_fd_operation_with_watchdog(
                 [&] { return conn.write_all(data, token); },
@@ -1291,6 +1426,12 @@ private:
             auto read_completed = std::make_shared<std::atomic<bool>>(false);
             auto read_failed = std::make_shared<std::atomic<bool>>(false);
             coro::cancel_source watchdog_cancel;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::response_watchdog_before_start_for_test.load(
+                    std::memory_order_acquire)) {
+                co_await hook();
+            }
+#endif
             auto make_watchdog =
                 [this, deadline, expect_first, expired, read_cancel, read_completed, read_failed,
                  stage = response_read_stage(reader_.decoder()),
@@ -1308,18 +1449,22 @@ private:
             io::io_result result{};
             std::exception_ptr failure;
             if (watchdog.is_ready()) {
+                std::exception_ptr startup_failure;
                 try { watchdog.await_resume(); }
-                catch (...) { failure = std::current_exception(); }
-                if (failure) {
-                    // An admitted task can publish its exception before its
-                    // frame is destroyed. Keep this exchange alive through it.
-                    try { co_await watchdog.wait_destroyed_async(); } catch (...) {}
-                    std::rethrow_exception(failure);
+                catch (...) { startup_failure = std::current_exception(); }
+                try { co_await watchdog.wait_destroyed_async(); }
+                catch (...) {
+                    if (!startup_failure) startup_failure = std::current_exception();
                 }
+                if (startup_failure) std::rethrow_exception(startup_failure);
             }
             try {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 detail::arm_client_response_read_observer_for_test();
+                if (auto hook = detail::response_watchdog_operation_entered_for_test.load(
+                        std::memory_order_acquire)) {
+                    hook();
+                }
 #endif
                 result = co_await conn_.read(data, size, read_cancel->get_token());
             } catch (...) {
@@ -1359,7 +1504,7 @@ private:
         }
 
         transport::connection_lease lease_;
-        connection& conn_;
+        detail::route_connection& conn_;
         const client_config& config_;
         const url& target_;
         response_reader reader_;
@@ -1385,9 +1530,14 @@ private:
             co_return detail::make_client_error(ECANCELED, client_stage::acquire);
         }
         if (!detail::is_valid_url_input(target.host_authority()) ||
+            (transport_->config().proxy && !detail::request_wire_view::valid_authority(target)) ||
             !detail::is_valid_request_target(req.path_with_query())) {
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);
+        }
+        if (transport_->config().proxy && req.get_method() == method::CONNECT) {
+            // This client returns HTTP responses, not caller-owned raw tunnels.
+            co_return detail::make_client_error(ENOTSUP, client_stage::request);
         }
         auto acquired = co_await transport_->acquire_leased_result(
             target, config_.connect_timeout, token);
@@ -1400,7 +1550,9 @@ private:
         const bool defer_body = req.expect_continue() && !req.body().empty();
         std::string request_data;
         try {
-            request_data = defer_body ? req.serialize_headers() : req.serialize();
+            request_data = detail::request_wire_view::serialize(req, target, lease.plan().key().mode,
+                                                               lease.plan().snapshot().proxy.get());
+            if (!defer_body) request_data += req.body();
         } catch (const std::invalid_argument& ex) {
             ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
             co_return detail::make_client_error(EINVAL, client_stage::request);
@@ -1434,6 +1586,12 @@ private:
         }
         auto redirect_url = url::resolve_reference(target, location);
         if (!redirect_url) return std::nullopt;
+        if (transport_->config().proxy &&
+            ((detail::has_uri_scheme(location) || location.starts_with("//")) &&
+             !detail::valid_proxy_uri_authority(location, *redirect_url))) {
+            ELIO_LOG_WARNING("Rejecting invalid proxy redirect authority");
+            return std::nullopt;
+        }
         if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
             ELIO_LOG_WARNING("Rejecting unsupported HTTP redirect scheme");
             return std::nullopt;

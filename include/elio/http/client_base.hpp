@@ -268,7 +268,7 @@ inline bool response_header_limits_exceeded(
 /// Base configuration shared by all HTTP-based clients
 /// Can be embedded in more specific configuration structures
 struct base_client_config {
-    std::chrono::seconds connect_timeout{10};     ///< TCP connect + TLS handshake timeout; <=0 disables
+    std::chrono::seconds connect_timeout{10};     ///< Post-DNS setup; HTTP proxy also includes CONNECT; <=0 disables
     std::chrono::seconds read_timeout{30};        ///< Read timeout; <=0 disables
     size_t read_buffer_size = 8192;               ///< Read buffer size
     std::string user_agent;                          ///< User-Agent header (empty = no header)
@@ -339,6 +339,8 @@ inline coro::task<void> make_setup_watchdog(
 
 // Transport-created roots have no caller alias and retire only after borrowed
 // exchange operations settle. Keep this policy out of the public connector.
+// The awaiting route connector may borrow the private deadline output so later
+// CONNECT/TLS layers consume the same post-DNS budget.
 inline coro::task<client_result<net::stream>>
 client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                tls::tls_context* tls_ctx,
@@ -349,7 +351,8 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
                std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
                std::shared_ptr<net::resolve_domain> dns_domain = {},
                std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {},
-               bool settled_root = false) {
+               bool settled_root = false,
+               std::optional<std::chrono::steady_clock::time_point>* setup_deadline_output = nullptr) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
@@ -395,6 +398,7 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
             ? std::chrono::steady_clock::time_point::max() : now + connect_timeout;
         if (!setup_deadline || cap < *setup_deadline) setup_deadline = cap;
     }
+    if (setup_deadline_output) *setup_deadline_output = setup_deadline;
     const bool deadline_enforced = sched != nullptr && setup_deadline.has_value();
     auto op_cancel_src = std::make_shared<coro::cancel_source>();
     auto timer_cancel_src = std::make_shared<coro::cancel_source>();

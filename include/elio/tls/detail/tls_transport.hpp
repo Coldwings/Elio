@@ -27,6 +27,7 @@ namespace elio::tls::detail {
 // this object until the lower layer has released its borrowed ciphertext lease.
 template<typename Lower>
 class basic_tls_transport : public std::enable_shared_from_this<basic_tls_transport<Lower>> {
+    friend struct tls_idle_access;
     using self_type = basic_tls_transport<Lower>;
     using wake_ptr = sync::detail::wake_state_ptr;
     using wake_list = std::list<wake_ptr>;
@@ -128,6 +129,9 @@ public:
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     void* read_publish_context = nullptr;
     void (*before_read_publish)(void*) = nullptr;
+    void* output_progress_context = nullptr;
+    coro::task<void> (*after_output_progress)(void*, uint64_t) = nullptr;
+    coro::task<void> (*after_output_inactive)(void*, uint64_t) = nullptr;
     bool output_active_for_test() const noexcept { return pump_active_; }
     void set_output_active_for_test(bool active) noexcept {
         std::lock_guard lock(mutex);
@@ -370,16 +374,29 @@ private:
                 sync::lock_guard write_guard(self->write_mutex_);
                 std::span<const std::byte> bytes;
                 bool finished = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                void* inactive_context = nullptr;
+                coro::task<void> (*inactive_hook)(void*, uint64_t) = nullptr;
+                uint64_t inactive_drained = 0;
+#endif
                 {
                     std::lock_guard lock(self->mutex);
                     bytes = self->output.pending();
                     if (bytes.empty()) {
                         self->pump_active_ = false;
                         finished = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        inactive_context = self->output_progress_context;
+                        inactive_hook = self->after_output_inactive;
+                        inactive_drained = self->output.drained_bytes();
+#endif
                     }
                 }
                 if (finished) {
                     self->notify_progress();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (inactive_hook) co_await inactive_hook(inactive_context, inactive_drained);
+#endif
                     co_return;
                 }
                 // Keep the head allocation until completion cleanup, including
@@ -387,11 +404,24 @@ private:
                 auto sent = co_await self->lower.write(bytes.data(), bytes.size(),
                     self->pump_cancel_.get_token());
                 if (sent.result > 0) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    void* progress_context;
+                    coro::task<void> (*progress_hook)(void*, uint64_t);
+                    uint64_t drained;
+#endif
                     {
                         std::lock_guard lock(self->mutex);
                         self->output.consume(static_cast<size_t>(sent.result));
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        progress_context = self->output_progress_context;
+                        progress_hook = self->after_output_progress;
+                        drained = self->output.drained_bytes();
+#endif
                     }
                     self->notify_progress();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (progress_hook) co_await progress_hook(progress_context, drained);
+#endif
                     continue;
                 }
                 if (sent.result == -EINTR) continue;

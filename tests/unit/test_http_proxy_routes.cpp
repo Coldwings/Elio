@@ -666,15 +666,40 @@ void pause_published_return() {
 }
 
 struct handoff_hooks {
-    explicit handoff_hooks(handoff_observation& value) {
+    explicit handoff_hooks(handoff_observation& value, bool pause_return = true) {
         handoff_observed.store(&value);
         detail::route_channel_for_test.store(handoff_channel);
-        detail::lease_after_publish_for_test.store(pause_published_return);
+        detail::lease_after_publish_for_test.store(
+            pause_return ? pause_published_return : nullptr);
     }
     ~handoff_hooks() {
         detail::route_channel_for_test.store(nullptr);
         detail::lease_after_publish_for_test.store(nullptr);
         handoff_observed.store(nullptr);
+    }
+};
+
+struct clear_observation {
+    std::latch visible{1};
+    std::latch release{1};
+};
+
+std::atomic<clear_observation*> clear_observed{nullptr};
+
+void pause_visible_clear() {
+    auto& observed = *clear_observed.load();
+    observed.visible.count_down();
+    observed.release.wait();
+}
+
+struct clear_hooks {
+    explicit clear_hooks(clear_observation& value) {
+        clear_observed.store(&value);
+        detail::transport_clear_visible_for_test.store(pause_visible_clear);
+    }
+    ~clear_hooks() {
+        detail::transport_clear_visible_for_test.store(nullptr);
+        clear_observed.store(nullptr);
     }
 };
 
@@ -816,6 +841,21 @@ struct returned_thread {
     }
 };
 
+struct cleared_thread {
+    clear_observation& observed;
+    std::thread worker;
+    ~cleared_thread() {
+        if (worker.joinable()) {
+            observed.release.count_down();
+            worker.join();
+        }
+    }
+    void join() {
+        observed.release.count_down();
+        worker.join();
+    }
+};
+
 template<typename T>
 T handoff_immediate(task<T> operation) {
     auto frame = elio::coro::detail::task_access::handle(operation);
@@ -886,6 +926,142 @@ TEST_CASE("Idle handoff cannot erase the next tunnel lease retirement owner",
         CHECK(::fcntl(descriptors[0], F_GETFD) == -1);
         CHECK(owner->active_operations_for_test() == 0);
         if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+    }
+}
+
+TEST_CASE("Idle tunnel roots remain shutdown operations until their lower frames release",
+          "[http][proxy][routes][handoff][shutdown][issue-1249]") {
+    using namespace elio::http::detail;
+    for (const bool finite : {false, true}) {
+        CAPTURE(finite);
+        transport_config config;
+        if (finite) config.limits = pool_limits{};
+        auto owner = std::make_shared<transport>(config);
+        const auto target = url::parse("https://localhost/");
+        REQUIRE(target);
+        std::array<int, 2> descriptors{};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                             0, descriptors.data()) == 0);
+        elio::net::tcp_stream peer{descriptors[1]};
+        elio::tls::tls_context context(elio::tls::tls_mode::client);
+        auto anchor = std::make_shared<route_retirement>();
+        connect_channel lower(elio::net::tcp_stream{descriptors[0]}, {}, 0, anchor);
+        std::array<char, 1> bytes{};
+        auto pending = std::make_unique<task<elio::io::io_result>>(
+            lower.read(bytes.data(), bytes.size(), {}));
+        handoff_observation observed;
+        observed.prepared.emplace(connect_tls_stream(std::move(lower), context),
+                                  std::move(anchor));
+        handoff_hooks hooks(observed, false);
+        auto acquired = handoff_immediate(owner->acquire_lease_for_test(*target));
+        REQUIRE(std::holds_alternative<transport::connection_lease_for_test>(acquired));
+        auto lease = std::move(std::get<transport::connection_lease_for_test>(acquired));
+        transport::return_lease_for_test(lease);
+        REQUIRE(owner->active_operations_for_test() == 1);
+        if (finite) REQUIRE(owner->admission_counters_for_test().idle == 1);
+
+        auto shutdown = owner->shutdown();
+        auto frame = elio::coro::detail::task_access::handle(shutdown);
+        frame.resume();
+        const bool waited_for_root = !frame.done();
+        CHECK(waited_for_root);
+        CHECK(owner->active_operations_for_test() == (waited_for_root ? 1 : 0));
+        if (finite) CHECK(owner->admission_counters_for_test().live == 1);
+
+        pending.reset();
+        CHECK(frame.done());
+        if (frame.done())
+            CHECK(shutdown.await_resume() == elio::coro::cancel_result::completed);
+        CHECK(owner->active_operations_for_test() == 0);
+        if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+        CHECK(::fcntl(descriptors[0], F_GETFD) == -1);
+    }
+}
+
+TEST_CASE("Clear owns published tunnel retirement before its active lease resets",
+          "[http][proxy][routes][handoff][shutdown][issue-1249]") {
+    using namespace elio::http::detail;
+    for (const bool finite : {false, true}) {
+        CAPTURE(finite);
+        transport_config config;
+        if (finite) config.limits = pool_limits{};
+        auto owner = std::make_shared<transport>(config);
+        const auto target = url::parse("https://localhost/");
+        REQUIRE(target);
+        std::array<int, 2> descriptors{};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                             0, descriptors.data()) == 0);
+        elio::net::tcp_stream peer{descriptors[1]};
+        elio::tls::tls_context context(elio::tls::tls_mode::client);
+        auto anchor = std::make_shared<route_retirement>();
+        connect_channel lower(elio::net::tcp_stream{descriptors[0]}, {}, 0, anchor);
+        std::array<char, 1> bytes{};
+        auto pending = std::make_unique<task<elio::io::io_result>>(
+            lower.read(bytes.data(), bytes.size(), {}));
+        handoff_observation handoff;
+        handoff.prepared.emplace(connect_tls_stream(std::move(lower), context),
+                                 std::move(anchor));
+        handoff_hooks handoff_scope(handoff);
+        clear_observation cleared;
+        clear_hooks clear_scope(cleared);
+        auto acquired = handoff_immediate(owner->acquire_lease_for_test(*target));
+        REQUIRE(std::holds_alternative<transport::connection_lease_for_test>(acquired));
+        auto lease = std::move(std::get<transport::connection_lease_for_test>(acquired));
+
+        std::exception_ptr return_failure;
+        std::atomic<bool> return_done{false};
+        returned_thread returning{handoff, std::thread([&] {
+            try { transport::return_lease_for_test(lease); }
+            catch (...) { return_failure = std::current_exception(); }
+            return_done.store(true, std::memory_order_release);
+        })};
+        const auto publish_deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        while (!handoff.published.try_wait() &&
+               !return_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < publish_deadline) {
+            std::this_thread::yield();
+        }
+        REQUIRE(handoff.published.try_wait());
+
+        std::exception_ptr clear_failure;
+        std::atomic<bool> clear_done{false};
+        cleared_thread clearing{cleared, std::thread([&] {
+            try { owner->clear(); }
+            catch (...) { clear_failure = std::current_exception(); }
+            clear_done.store(true, std::memory_order_release);
+        })};
+        const auto clear_deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        while (!cleared.visible.try_wait() &&
+               !clear_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < clear_deadline) {
+            std::this_thread::yield();
+        }
+        REQUIRE(cleared.visible.try_wait());
+
+        returning.join();
+        if (return_failure) std::rethrow_exception(return_failure);
+        REQUIRE(owner->active_operations_for_test() == 1);
+        if (finite) REQUIRE(owner->admission_counters_for_test().live == 1);
+
+        auto shutdown = owner->shutdown();
+        auto frame = elio::coro::detail::task_access::handle(shutdown);
+        frame.resume();
+        CHECK_FALSE(frame.done());
+
+        clearing.join();
+        if (clear_failure) std::rethrow_exception(clear_failure);
+        CHECK_FALSE(frame.done());
+        CHECK(owner->active_operations_for_test() == 1);
+
+        pending.reset();
+        CHECK(frame.done());
+        if (frame.done())
+            CHECK(shutdown.await_resume() == elio::coro::cancel_result::completed);
+        CHECK(owner->active_operations_for_test() == 0);
+        if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+        CHECK(::fcntl(descriptors[0], F_GETFD) == -1);
     }
 }
 

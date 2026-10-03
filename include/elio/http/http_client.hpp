@@ -469,29 +469,53 @@ private:
     public:
         operation_lease() noexcept = default;
         operation_lease(operation_lease&& other) noexcept
-            : owner_(std::move(other.owner_)), generation_(other.generation_) {}
+            : owner_(std::move(other.owner_)), retirement_owner_(std::move(other.retirement_owner_)),
+              generation_(other.generation_), registered_(std::exchange(other.registered_, false)) {}
         operation_lease& operator=(operation_lease&& other) noexcept {
             if (this != &other) {
-                reset();
+                finish();
                 owner_ = std::move(other.owner_);
+                retirement_owner_ = std::move(other.retirement_owner_);
                 generation_ = other.generation_;
+                registered_ = std::exchange(other.registered_, false);
             }
             return *this;
         }
         operation_lease(const operation_lease&) = delete;
         operation_lease& operator=(const operation_lease&) = delete;
-        ~operation_lease() { reset(); }
+        ~operation_lease() { finish(); }
         operation_lease(std::shared_ptr<state> owner, uint64_t generation) noexcept
-            : owner_(std::move(owner)), generation_(generation) {}
-        void reset() noexcept {
-            if (auto owner = std::move(owner_)) owner->finish_operation();
-        }
+            : owner_(owner), retirement_owner_(std::move(owner)), generation_(generation),
+              registered_(true) {}
+        void reset() noexcept { finish(); }
+        void handoff_to_root_locked() noexcept { owner_.reset(); }
         const std::shared_ptr<state>& owner() const noexcept { return owner_; }
         uint64_t generation() const noexcept { return generation_; }
 
     private:
+        void finish() noexcept {
+            auto owner = retirement_owner_.lock();
+            if (!owner) {
+                owner_.reset();
+                registered_ = false;
+                return;
+            }
+            bool notify = false;
+            {
+                std::lock_guard lock(owner->mutex);
+                owner_.reset();
+                if (registered_) {
+                    registered_ = false;
+                    if (owner->active_operations != 0)
+                        notify = --owner->active_operations == 0;
+                }
+            }
+            if (notify) owner->settled.set();
+        }
         std::shared_ptr<state> owner_;
+        std::weak_ptr<state> retirement_owner_;
         uint64_t generation_ = 0;
+        bool registered_ = false;
     };
 
     class connection_lease {
@@ -571,13 +595,14 @@ private:
                 // late insertion cannot escape it. Stream cleanup runs outside.
                 std::lock_guard lock(owner->mutex);
                 if (!owner->closing && operation_->generation() == owner->generation) {
-                    // Clear the outgoing owner before publication. Once idle,
-                    // another lease may install its owner in this same slot.
-                    if (anchor) anchor->operation.reset();
+                    // Keep the preallocated operation token in the idle root.
                     if (owner->admission) {
                         admission_change.emplace(owner->admission->retain(capacity_, conn_));
                         retained = admission_change->retained;
                     } else retained = owner->idle.retain(plan_.key(), conn_);
+                    // The root remains shutdown-visible while idle, but its
+                    // state edge must be weak because state owns the pool.
+                    if (retained && anchor) operation_->handoff_to_root_locked();
                 }
             }
             if (!retained) {
@@ -590,7 +615,7 @@ private:
             disposition_ = disposition::returned;
             conn_.disconnect();
             observe_disposition(fd, true);
-            operation_->reset();
+            if (!anchor) operation_->reset();
             operation_.reset();
         }
 

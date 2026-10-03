@@ -13,6 +13,12 @@
 
 namespace elio::sync {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<void (*)()> event_dispatch_storage_for_test{nullptr};
+}
+#endif
+
 /// Coroutine-aware event (manual reset)
 class event {
 public:
@@ -235,11 +241,21 @@ public:
         return cancellable_wait_awaitable(*this, std::move(token));
     }
 
-    /// Signal the event (wake all waiters)
+    /// Signal the event (wake all waiters). Dispatch-storage allocation can
+    /// throw before changing the signal or selecting any pending waiter.
     void set() {
         std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
+            // Prepare all dispatch storage before publishing the signal or
+            // claiming wakes. No throwing growth may lose selected waiters.
+            if (!waiters_.empty()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::event_dispatch_storage_for_test.load(std::memory_order_acquire))
+                    hook();
+#endif
+                to_schedule.reserve(waiters_.size());
+            }
             signaled_.store(true, std::memory_order_release);
 
             // Collect handles and pop from list under lock.
@@ -270,6 +286,36 @@ public:
     bool is_set() const noexcept {
         return signaled_.load(std::memory_order_acquire);
     }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    size_t waiter_count_for_test() {
+        std::lock_guard guard(mutex_);
+        return waiters_.size();
+    }
+
+    // Fixture recovery cannot call set(): this test suite intentionally
+    // exercises set()'s throwing dispatch-storage boundary. Publish the
+    // signal and drain one retained wake at a time without allocating.
+    void release_waiters_for_test() noexcept {
+        signaled_.store(true, std::memory_order_release);
+        for (;;) {
+            detail::wake_state_ptr to_schedule;
+            {
+                std::lock_guard guard(mutex_);
+                if (waiters_.empty()) return;
+
+                auto* waiter = waiters_.pop_front();
+                if (waiter->cancellable_ &&
+                    detail::claim_wake_state(waiter->wake_state_) ==
+                        detail::wake_action::rejected) {
+                    continue;
+                }
+                to_schedule = waiter->wake_state_;
+            }
+            detail::schedule_wake_state(to_schedule);
+        }
+    }
+#endif
 
 private:
     std::mutex mutex_;

@@ -610,7 +610,8 @@ if another shared acquisition cannot be represented.
 
 ### Event
 
-`event` is a one-shot signaling primitive. One or more coroutines wait for the event to be set:
+`event` is a manual-reset signaling primitive. One or more coroutines wait for
+the event to be set; subsequent waits complete until `reset()` clears it:
 
 ```cpp
 sync::event evt;
@@ -627,6 +628,13 @@ coro::task<void> signaler() {
     co_return;
 }
 ```
+
+`set()` prepares dispatch storage before changing the signal or selecting
+pending waiters. Storage preparation can throw, for example `std::bad_alloc`;
+the prior signal state and pending waits remain unchanged, so callers can retry
+or cancel token-aware waits. Successful signaling dispatches outside the event
+mutex. Keep the event, scheduler and waiter frames alive until pending operations
+normally complete; signaling failure does not authorize frame destruction.
 
 ### Channel
 

@@ -64,6 +64,7 @@ set(TEST_SOURCES
     unit/test_file_operations.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
+    unit/test_event_signal_allocation.cpp
     unit/test_intrusive_list.cpp
     unit/test_sync_cancellation.cpp
     unit/test_channel_debug.cpp
@@ -143,6 +144,7 @@ if(TARGET elio_tls)
         unit/test_http_root_close.cpp
         unit/test_http_pool_admission.cpp
         unit/test_http_fd_watchdog.cpp
+        unit/test_http_setup_watchdog.cpp
         unit/test_http_empty_redirect.cpp
     )
 endif()

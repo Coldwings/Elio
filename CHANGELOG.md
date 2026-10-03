@@ -235,6 +235,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read; timer/fallback cleanup and the absolute response deadline are preserved
   (#1283).
 
+- **Event signaling allocation safety**: `sync::event::set()` prepares all
+  dispatch storage before changing the signal or removing/claiming waiters.
+  Allocation failure now leaves pending waits recoverable by cancellation or
+  retry, rather than losing selected wakes. Successful signaling still dispatches
+  outside the event mutex; waiter/frame lifetime rules are unchanged (#1291).
+
+- **Connector setup watchdog failures**: construct the owning TCP/TLS deadline
+  frame before admission, observe rejected admission before starting setup, and
+  cooperatively cancel pending sibling I/O if timer evaluation throws. Normal
+  cleanup preserves the original exception without forcing frame destruction
+  (#1287).
+
+- **FD watchdog admission rejection**: observe an already-exceptional watchdog
+  handle before invoking its sibling I/O factory, preventing accepted
+  HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).
+
+- **FD watchdog timer exceptions**: HTTP-family timer failures interrupt their
+  still-owned sibling I/O so cleanup can join both operations and propagate the
+  exception. Owned stream callbacks also record TLS external-abort state when
+  healthy I/O races the active timer failure. Cleanup-time failures after timer
+  cancellation do not abort a successful operation or masquerade as ordinary
+  deadline expiry (#1278).
+
+- **TLS duplex abort cleanup**: reserve allocation-free terminal output
+  settlement for the permitted reader, writer and concurrent abort, rather than
+  terminating when the third operation waits for the owning pump (#1279).
+
 - **HTTP Transport TCP retirement**: private root sockets retain their immediate,
   non-lingering local close policy across moves and setup exceptions. Plain HTTP
   active discard, idle clearing and shutdown now close the descriptor before

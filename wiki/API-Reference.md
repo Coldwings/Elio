@@ -4726,8 +4726,8 @@ result does not establish lossless peer delivery. This is not a directional
 half-close API; use `finish_write()` for protocol-aware output completion.
 The HTTP CONNECT handoff is a separate feature, not supplied by TLS closure.
 Whole-session shutdown retires the transport; this object has no TLS-session
-reset or re-handshake API. Terminal output settlement uses two pre-reserved
-notification slots for the permitted reader/writer pair, without allocating
+reset or re-handshake API. Terminal output settlement uses three pre-reserved
+notification slots for the permitted reader, writer and concurrent abort, without allocating
 new cleanup waiters.
 
 `finish_write()` requires a completed handshake. It leaves
@@ -5117,7 +5117,8 @@ coro::task<void> waiter() {
 
 ### `event`
 
-One-shot signaling primitive. One or more coroutines wait for the event to be set.
+Manual-reset signaling primitive. One or more coroutines wait for the event to
+be set; subsequent waits complete until `reset()` clears it.
 
 ```cpp
 class event {
@@ -5147,6 +5148,14 @@ owned wake state and may propagate `std::bad_alloc`; that state keeps a dequeued
 wake safe if the coroutine frame is destroyed before scheduling. Token-aware
 waits create their arbitration state eagerly so cancellation can race `set()`
 with exactly one terminal result.
+
+`set()` prepares dispatch storage before changing the signal or selecting
+pending waiters. Storage preparation can throw, for example `std::bad_alloc`;
+the prior signal state and pending waits remain unchanged, so callers can retry
+or cancel token-aware waits. Successful signaling dispatches outside the event
+mutex. Keep the event, scheduler, and waiter frames alive until pending
+operations normally complete; signaling failure does not authorize frame
+destruction.
 
 ### `channel<T>`
 

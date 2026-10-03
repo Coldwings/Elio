@@ -25,12 +25,14 @@
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -51,6 +53,10 @@ inline std::atomic<size_t> fd_watchdog_shutdowns_for_test{0};
 using setup_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::steady_clock::time_point, coro::cancel_token);
 inline std::atomic<setup_watchdog_wait_hook> setup_watchdog_wait_for_test{nullptr};
+inline std::atomic<void (*)()> setup_watchdog_before_construct_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> setup_watchdog_before_start_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> setup_watchdog_after_start_for_test{nullptr};
+inline std::atomic<void (*)()> setup_connect_entered_for_test{nullptr};
 inline std::atomic<void(*)()> tls_setup_entered_for_test{nullptr};
 
 inline void arm_client_response_read_observer_for_test() noexcept {
@@ -78,51 +84,79 @@ inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_
     return offset;
 }
 
+template<typename Abort = std::nullptr_t>
+coro::task<void> fd_shutdown_watchdog_task(
+        int fd, std::chrono::nanoseconds timeout, coro::cancel_token tok,
+        std::shared_ptr<std::atomic<bool>> flag, Abort abort = nullptr) {
+    static_assert(std::is_same_v<Abort, std::nullptr_t> ||
+                  std::is_nothrow_invocable_v<Abort&>);
+    auto interrupt = [&]() noexcept {
+        if constexpr (std::is_same_v<Abort, std::nullptr_t>) {
+            if (fd < 0) return;
+            ::shutdown(fd, SHUT_RDWR);
+        } else {
+            std::invoke(abort);
+        }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+    };
+    coro::cancel_result r;
+    try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
+            r = co_await hook(timeout, tok);
+        } else
+#endif
+        {
+            r = co_await elio::time::sleep_for(timeout, tok);
+        }
+    } catch (...) {
+        // The helper cannot join us until its sibling I/O returns.
+        // A cleanup-time exception must not abort successful I/O.
+        if (!tok.is_cancelled()) interrupt();
+        throw;
+    }
+    if (r == coro::cancel_result::completed) {
+        flag->store(true, std::memory_order_release);
+        interrupt();
+    }
+    co_return;
+}
+
 /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses.
-///
-/// The returned join_handle must be awaited after the I/O operation completes;
-/// the caller cancels `watchdog_token` to wake the watchdog early on success.
-/// `timed_out` is set only when the deadline fired before cancellation.
-inline coro::join_handle<void>
+/// The caller cancels the token on completion and joins before releasing `fd`.
+/// Timer exceptions interrupt active sibling I/O without setting `timed_out`.
+/// An optional noexcept callback also records layered-stream abort state.
+/// Its borrowed stream must remain unmoved/alive until the watchdog is joined;
+/// callback destruction must not access that stream.
+template<typename Abort = std::nullptr_t>
+coro::join_handle<void>
 arm_fd_shutdown_watchdog(runtime::scheduler* sched,
                          int fd,
                          std::chrono::nanoseconds timeout,
                          coro::cancel_token watchdog_token,
-                         std::shared_ptr<std::atomic<bool>> timed_out) {
-    return sched->go_joinable(
-        [fd, timeout, tok = std::move(watchdog_token),
-         flag = std::move(timed_out)]() -> coro::task<void> {
-            coro::cancel_result r;
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-            if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
-                r = co_await hook(timeout, tok);
-            } else
-#endif
-            {
-                r = co_await elio::time::sleep_for(timeout, tok);
-            }
-            if (r == coro::cancel_result::completed) {
-                flag->store(true, std::memory_order_release);
-                if (fd >= 0) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                    fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
-#endif
-                    ::shutdown(fd, SHUT_RDWR);
-                }
-            }
-            co_return;
-        });
+                         std::shared_ptr<std::atomic<bool>> timed_out,
+                         Abort abort = nullptr) {
+    // Construct the owning frame before admission: a lazy callable wrapper
+    // could fail allocating it after the sibling I/O has already suspended.
+    return sched->go_joinable(fd_shutdown_watchdog_task(
+        fd, timeout, std::move(watchdog_token), std::move(timed_out), std::move(abort)));
 }
 
 // Admit the watchdog inside this frame, before invoking the factory. Creating
 // the operation task can itself throw, so accepting a pre-built task is unsafe.
-template<typename OperationFactory>
+template<typename OperationFactory, typename Abort = std::nullptr_t>
 coro::task<io::io_result> await_fd_operation_with_watchdog(
         OperationFactory operation, runtime::scheduler* scheduler, int fd,
-        std::chrono::nanoseconds timeout, std::shared_ptr<std::atomic<bool>> timed_out) {
+        std::chrono::nanoseconds timeout, std::shared_ptr<std::atomic<bool>> timed_out,
+        Abort abort = nullptr) {
     coro::cancel_source stop;
     auto watchdog = arm_fd_shutdown_watchdog(
-        scheduler, fd, timeout, stop.get_token(), std::move(timed_out));
+        scheduler, fd, timeout, stop.get_token(), std::move(timed_out), std::move(abort));
+    // Rejected admission returns an exceptional ready handle, not a throw.
+    // Observe it before starting I/O that would otherwise have no watchdog.
+    if (watchdog.is_ready()) watchdog.await_resume();
     io::io_result result{};
     std::exception_ptr failure;
     try {
@@ -263,6 +297,46 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
 
 namespace detail {
 
+inline coro::task<void> setup_watchdog_task(
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<coro::cancel_source> timer_source,
+        std::shared_ptr<coro::cancel_source> op_source,
+        std::shared_ptr<std::atomic<bool>> flag) {
+    try {
+        coro::cancel_result result;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = setup_watchdog_wait_for_test.load(std::memory_order_acquire))
+            result = co_await hook(deadline, timer_source->get_token());
+        else
+#endif
+            result = co_await elio::time::sleep_for(
+                deadline - std::chrono::steady_clock::now(), timer_source->get_token());
+        if (result == coro::cancel_result::completed) {
+            flag->store(true, std::memory_order_release);
+            op_source->cancel();
+        }
+    } catch (...) {
+        // A failed timer must release suspended setup before its result can be
+        // observed. A cancellation callback must not replace the first failure.
+        const auto failure = std::current_exception();
+        try { op_source->cancel(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+}
+
+inline coro::task<void> make_setup_watchdog(
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<coro::cancel_source> timer_source,
+        std::shared_ptr<coro::cancel_source> op_source,
+        std::shared_ptr<std::atomic<bool>> flag) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (auto hook = setup_watchdog_before_construct_for_test.load(std::memory_order_acquire))
+        hook();
+#endif
+    return setup_watchdog_task(deadline, std::move(timer_source),
+                               std::move(op_source), std::move(flag));
+}
+
 // Transport-created roots have no caller alias and retire only after borrowed
 // exchange operations settle. Keep this policy out of the public connector.
 inline coro::task<client_result<net::stream>>
@@ -330,25 +404,30 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
         token.on_cancel([op_cancel_src]() { op_cancel_src->cancel(); });
 
     if (deadline_enforced) {
-        watchdog.emplace(sched->go_joinable(
-            [deadline = *setup_deadline,
-             timer_source = timer_cancel_src,
-             op_source = op_cancel_src,
-             flag = timed_out]() -> coro::task<void> {
-                coro::cancel_result r;
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = detail::setup_watchdog_wait_for_test.load(std::memory_order_acquire))
-                    r = co_await hook(deadline, timer_source->get_token());
-                else
+        if (auto hook = setup_watchdog_before_start_for_test.load(std::memory_order_acquire))
+            co_await hook();
 #endif
-                    r = co_await elio::time::sleep_for(
-                        deadline - std::chrono::steady_clock::now(), timer_source->get_token());
-                if (r == coro::cancel_result::completed) {
-                    flag->store(true, std::memory_order_release);
-                    op_source->cancel();
-                }
-                co_return;
-            }));
+        // Construct the owning timer frame before independent admission and
+        // observe rejection before starting any TCP/TLS sibling work.
+        watchdog.emplace(sched->go_joinable(make_setup_watchdog(
+            *setup_deadline, timer_cancel_src, op_cancel_src, timed_out)));
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = setup_watchdog_after_start_for_test.load(std::memory_order_acquire))
+            co_await hook();
+#endif
+        if (watchdog->is_ready()) {
+            // Admission rejection is already destroyed, but an admitted timer
+            // may publish its result before its owning detached frame retires.
+            std::exception_ptr startup_failure;
+            try { watchdog->await_resume(); }
+            catch (...) { startup_failure = std::current_exception(); }
+            try { co_await watchdog->wait_destroyed_async(); }
+            catch (...) {
+                if (!startup_failure) startup_failure = std::current_exception();
+            }
+            if (startup_failure) std::rethrow_exception(startup_failure);
+        }
     }
 
     auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {
@@ -365,6 +444,9 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
     auto last_error = detail::make_client_error(ECONNREFUSED, client_stage::connect);
 
     auto connect_addresses = [&]() -> coro::task<client_result<net::stream>> {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = setup_connect_entered_for_test.load(std::memory_order_acquire)) hook();
+#endif
         if (secure) {
             if (!tls_ctx) {
                 co_return detail::make_client_error(EINVAL, client_stage::tls);
@@ -448,7 +530,12 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
         auto wd = std::move(*watchdog);
         watchdog.reset();
         try {
-            co_await std::move(wd);
+            co_await wd;
+        } catch (...) {
+            if (!setup_failure) setup_failure = std::current_exception();
+        }
+        try {
+            co_await wd.wait_destroyed_async();
         } catch (...) {
             if (!setup_failure) setup_failure = std::current_exception();
         }

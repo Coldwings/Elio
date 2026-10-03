@@ -195,3 +195,15 @@ TEST_CASE("HTTP forward projection rejects alternate authority or fragment paths
     REQUIRE_THROWS_AS(detail::request_wire_view::serialize(req, *parsed,
         detail::route_mode::forward_proxy, nullptr), std::invalid_argument);
 }
+
+TEST_CASE("Proxy request projection rejects an empty aggregate target host",
+          "[http][proxy][wire][authority][issue-1249]") {
+    url target;
+    target.scheme = "http";
+    target.path = "/";
+    request req(method::GET, "/");
+    const auto profile = wire_profile();
+    CHECK_FALSE(detail::request_wire_view::valid_authority(target));
+    CHECK_THROWS_AS(detail::request_wire_view::serialize(req, target,
+        detail::route_mode::forward_proxy, profile.get()), std::invalid_argument);
+}

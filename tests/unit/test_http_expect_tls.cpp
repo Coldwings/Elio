@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/io/io_awaitables.hpp>
 #include <elio/sync/event.hpp>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
@@ -15,6 +16,7 @@
 #include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
 #include <system_error>
 #include <thread>
 #include <unistd.h>
@@ -42,6 +44,14 @@ struct certificate_file {
         if (file) ::fclose(file);
         ::unlink(path.data());
     }
+};
+
+struct empty_connection_probe {
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ~empty_connection_probe() { if (fd >= 0) ::close(fd); }
+    empty_connection_probe() = default;
+    empty_connection_probe(const empty_connection_probe&) = delete;
+    empty_connection_probe& operator=(const empty_connection_probe&) = delete;
 };
 
 void install_certificate(tls::tls_context& context, certificate_file& ca) {
@@ -98,6 +108,7 @@ struct expect_observation {
     expect_action action = expect_action::fallback;
     coro::cancel_source* request_stop = nullptr;
     bool accepted = false;
+    size_t empty_connections = 0;
     bool handshake = false;
     bool saw_expect = false;
     bool early_body = false;
@@ -208,10 +219,48 @@ struct expect_hooks {
     }
 };
 
+coro::task<int> peek_fixture_payload(net::tcp_stream& stream, coro::cancel_token token) {
+    char first;
+    for (;;) {
+        auto read = co_await io::async_recv(stream.fd(), &first, 1, MSG_PEEK, token);
+        if (read.was_cancelled()) co_return -ECANCELED;
+        if (read.io.result == -EINTR) continue;
+        if (read.io.result != -EAGAIN && read.io.result != -EWOULDBLOCK)
+            co_return read.io.result;
+        auto ready = co_await stream.poll_read(token);
+        if (ready.was_cancelled()) co_return -ECANCELED;
+        if (ready.io.result < 0) co_return ready.io.result;
+    }
+}
+
+coro::task<std::optional<net::tcp_stream>> accept_fixture_payload(
+        net::tcp_listener& listener, expect_observation& observed,
+        coro::cancel_token token) {
+    for (;;) {
+        auto accepted = co_await listener.accept(token);
+        if (!accepted) {
+            observed.server_error = errno;
+            co_return std::nullopt;
+        }
+        // Local probes can arrive before the fixture's client. Peek so neither
+        // an HTTP request nor a TLS ClientHello byte is consumed.
+        const auto payload = co_await peek_fixture_payload(*accepted, token);
+        if (payload == 0) {
+            ++observed.empty_connections;
+            continue;
+        }
+        if (payload < 0) {
+            observed.server_error = -payload;
+            co_return std::nullopt;
+        }
+        co_return accepted;
+    }
+}
+
 coro::task<void> serve_no_continue(net::tcp_listener& listener, tls::tls_context& context,
         bool encrypted, expect_observation& observed, coro::cancel_token token) {
-    auto tcp = co_await listener.accept(token);
-    if (!tcp) { observed.server_error = errno; co_return; }
+    auto tcp = co_await accept_fixture_payload(listener, observed, token);
+    if (!tcp) co_return;
     observed.accepted = true;
     std::optional<net::stream> peer;
     if (encrypted) {
@@ -389,6 +438,84 @@ TEST_CASE("Response watchdog construction failure precedes sibling read",
     CHECK_FALSE(read_staged);
     CHECK(bad_allocation);
     CHECK_FALSE(handler_called);
+    CHECK(shutdown_result == coro::cancel_result::completed);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Expect fixtures skip local peers that close before TLS payload",
+          "[http][client][expect-continue][fixture-peer][issue-1283]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    CAPTURE(selected);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    expect_observation observed;
+    expect_hooks hooks(selected, observed);
+    auto listener = net::tcp_listener::bind(net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    empty_connection_probe probe;
+    REQUIRE(probe.fd >= 0);
+    const auto address = net::ipv4_address(
+        "127.0.0.1", listener->local_address().port()).to_sockaddr();
+    REQUIRE(::connect(probe.fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) == 0);
+    REQUIRE(::shutdown(probe.fd, SHUT_WR) == 0);
+    tls::tls_context server_context(tls::tls_mode::server);
+    certificate_file ca;
+    install_certificate(server_context, ca);
+    http::transport_config config;
+    config.limits = http::pool_limits{};
+    config.configure_tls = [&](http::transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("fixture-peer CA trust setup failed");
+    };
+    auto owner = std::make_shared<http::transport>(config);
+    http::client_config policy;
+    policy.connect_timeout = std::chrono::seconds(2);
+    policy.read_timeout = std::chrono::seconds(5);
+    policy.expect_continue_timeout = std::chrono::seconds(1);
+    http::client client(owner, policy);
+    const auto target = http::url::parse("https://127.0.0.1:" +
+        std::to_string(listener->local_address().port()) + "/");
+    REQUIRE(target);
+    http::request request(http::method::POST, "/");
+    request.set_body(std::string_view("payload"));
+    request.set_expect_continue();
+    coro::cancel_source stop;
+    std::optional<http::client_result<http::response>> result;
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_no_continue(
+        *listener, server_context, true, observed, stop.get_token()));
+    auto requested = scheduler.go_joinable([&]() -> coro::task<void> {
+        result.emplace(co_await client.send_result(request, *target));
+    });
+    requested.wait_destroyed();
+    auto shutdown = scheduler.go_joinable(owner->shutdown());
+    shutdown.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    requested.await_resume();
+    const auto shutdown_result = shutdown.await_resume();
+    server.await_resume();
+    REQUIRE(result);
+    if (const auto* error = std::get_if<http::client_error>(&*result)) {
+        CAPTURE(error->stage, error->code.value(), observed.accepted,
+                observed.empty_connections, observed.handshake,
+                observed.server_error, observed.timer_calls, observed.read_staged);
+        REQUIRE_FALSE(error);
+    }
+    REQUIRE(std::holds_alternative<http::response>(*result));
+    CHECK(std::get<http::response>(*result).body() == "ok");
+    CHECK(observed.empty_connections == 1);
+    CHECK(observed.accepted);
+    CHECK(observed.handshake);
+    CHECK(observed.saw_expect);
+    CHECK(observed.received_body);
     CHECK(shutdown_result == coro::cancel_result::completed);
     CHECK(owner->admission_counters_for_test().live == 0);
 }

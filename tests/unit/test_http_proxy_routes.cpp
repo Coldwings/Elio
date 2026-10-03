@@ -2366,7 +2366,7 @@ struct deferred_close_submission {
 } // namespace
 
 TEST_CASE("Owned Transport roots close before releasing their accounting owner",
-          "[http][tls][retirement][issue-1272][root-close]") {
+          "[http][tls][retirement][issue-1272][root-close][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto direct = GENERATE(false, true);
     backend_guard backend_selection(selected);
@@ -2404,7 +2404,7 @@ TEST_CASE("Owned Transport roots close before releasing their accounting owner",
 }
 
 TEST_CASE("Settled root close survives moves and exclusive setup failure",
-          "[http][tls][retirement][issue-1272][root-close]") {
+          "[http][tls][retirement][issue-1272][root-close][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto phase = GENERATE(0, 1, 2);
     backend_guard backend_selection(selected);
@@ -2459,7 +2459,7 @@ TEST_CASE("Settled root close survives moves and exclusive setup failure",
 }
 
 TEST_CASE("TLS root retirement notifies its preallocated observer without wake allocation",
-          "[http][tls][retirement][issue-1272]") {
+          "[http][tls][retirement][issue-1272][http_client_streaming]") {
     const auto phase = GENERATE(0, 1, 2);
     auto retirement = std::make_shared<elio::tls::detail::tls_root_retirement>();
     const auto released = retirement->released;
@@ -2912,7 +2912,7 @@ void count_fixture_recovery(void* context) noexcept {
 } // namespace
 
 TEST_CASE("Retirement fixtures release and join held frames before reporting exceptions",
-          "[http][tls][retirement][issue-1272][fixture-exception]") {
+          "[http][tls][retirement][issue-1272][fixture-exception][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto observer_failure = GENERATE(false, true);
     const auto workers = GENERATE(size_t{1}, size_t{2});
@@ -2968,7 +2968,7 @@ TEST_CASE("Retirement fixtures release and join held frames before reporting exc
 }
 
 TEST_CASE("Direct HTTPS Transport retains root accounting through late owned output frames",
-          "[http][tls][retirement][issue-1272]") {
+          "[http][tls][retirement][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto finite = GENERATE(false, true);
     const auto inactive = GENERATE(false, true);
@@ -3091,7 +3091,7 @@ TEST_CASE("Direct HTTPS Transport retains root accounting through late owned out
 }
 
 TEST_CASE("Failed direct TLS setup retains accounting until its late output root is destroyed",
-          "[http][tls][retirement][setup-failure][issue-1272]") {
+          "[http][tls][retirement][setup-failure][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto finite = GENERATE(false, true);
     const auto workers = GENERATE(size_t{1}, size_t{2});
@@ -3190,7 +3190,7 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
 }
 
 TEST_CASE("Completed setup watchdog fixture recovers after an early direct TLS failure",
-          "[http][tls][retirement][fixture-recovery][issue-1272]") {
+          "[http][tls][retirement][fixture-recovery][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -3281,7 +3281,7 @@ TEST_CASE("Completed setup watchdog fixture recovers after an early direct TLS f
 }
 
 TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
-          "[http][tls][retirement][setup-watchdog-failure][issue-1272]") {
+          "[http][tls][retirement][setup-watchdog-failure][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto version = GENERATE(elio::tls::tls_version::tls_1_2,
                                   elio::tls::tls_version::tls_1_3);
@@ -3423,7 +3423,7 @@ TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
 }
 
 TEST_CASE("Direct TLS retry waits for the failed physical root to close",
-          "[http][tls][retirement][retry][issue-1272]") {
+          "[http][tls][retirement][retry][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     CAPTURE(selected);
     backend_guard backend_scope(selected);

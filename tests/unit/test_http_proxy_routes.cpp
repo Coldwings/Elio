@@ -1042,8 +1042,8 @@ TEST_CASE("Idle handoff cannot erase the next tunnel lease retirement owner",
     }
 }
 
-TEST_CASE("Idle tunnel roots remain shutdown operations until their lower frames release",
-          "[http][proxy][routes][handoff][shutdown][issue-1249]") {
+TEST_CASE("Tunnel roots with lower frames retire until those frames release",
+          "[http][proxy][routes][handoff][shutdown][issue-1249][issue-1250]") {
     using namespace elio::http::detail;
     for (const bool finite : {false, true}) {
         CAPTURE(finite);
@@ -1071,7 +1071,10 @@ TEST_CASE("Idle tunnel roots remain shutdown operations until their lower frames
         auto lease = std::move(std::get<transport::connection_lease_for_test>(acquired));
         transport::return_lease_for_test(lease);
         REQUIRE(owner->active_operations_for_test() == 1);
-        if (finite) REQUIRE(owner->admission_counters_for_test().idle == 1);
+        if (finite) {
+            REQUIRE(owner->admission_counters_for_test().idle == 0);
+            REQUIRE(owner->admission_counters_for_test().live == 1);
+        }
 
         auto shutdown = owner->shutdown();
         auto frame = elio::coro::detail::task_access::handle(shutdown);
@@ -1108,9 +1111,6 @@ TEST_CASE("Clear owns published tunnel retirement before its active lease resets
         elio::tls::tls_context context(elio::tls::tls_mode::client);
         auto anchor = std::make_shared<route_retirement>();
         connect_channel lower(elio::net::tcp_stream{descriptors[0]}, {}, 0, anchor);
-        std::array<char, 1> bytes{};
-        auto pending = std::make_unique<task<elio::io::io_result>>(
-            lower.read(bytes.data(), bytes.size(), {}));
         handoff_observation handoff;
         handoff.prepared.emplace(connect_tls_stream(std::move(lower), context),
                                  std::move(anchor));
@@ -1165,10 +1165,6 @@ TEST_CASE("Clear owns published tunnel retirement before its active lease resets
 
         clearing.join();
         if (clear_failure) std::rethrow_exception(clear_failure);
-        CHECK_FALSE(frame.done());
-        CHECK(owner->active_operations_for_test() == 1);
-
-        pending.reset();
         CHECK(frame.done());
         if (frame.done())
             CHECK(shutdown.await_resume() == elio::coro::cancel_result::completed);

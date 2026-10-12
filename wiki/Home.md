@@ -12,7 +12,7 @@
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Signal Handling**: Coroutine-friendly signal handling via signalfd
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable
-- **Timers**: cancellation-aware sleep_for/sleep_until overloads; yield reschedules execution
+- **Timers**: sleep_for (with a cancellation-token overload), non-cancellable sleep_until, and yield for rescheduling
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification

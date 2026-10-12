@@ -716,4 +716,8 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Approaching Stable | **Version**: 0.6.0 | **Last Release**: 0.6.0 (2026-07-20)
+**Status**: Approaching Stable | **Version**: 0.6.0 | **Last Release**: [0.6.0](https://github.com/Coldwings/Elio/releases/tag/v0.6.0) (2026-10-12)
+
+Upgrading from 0.5.x? Review the [0.6 migration guide](wiki/Migrating-to-0.6.md)
+for API and behavior changes, and the [changelog](CHANGELOG.md#060---2026-10-12)
+for the complete release notes and known limitations.

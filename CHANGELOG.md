@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-12
+
+This is the first formal 0.6 release. It includes intentional API and
+behavior changes from 0.5.x; see the
+[migration guide](wiki/Migrating-to-0.6.md) before upgrading.
+
 ### Added
 
 - **HTTPS proxy routes with independent TLS domains**: `http_proxy_config`
@@ -253,6 +259,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latency while a worker's local runnable deque remains non-empty. A short
   `--smoke` mode verifies build and termination in CI without imposing timing
   thresholds on shared runners (#1015).
+
+- **Runtime task cancellation contexts**: Every task execution context now owns
+  cooperative cancellation authority. `join_handle::request_cancel()` remains
+  valid across task completion and frame destruction, while
+  `this_coro::cancel_token()` exposes the active task token with a
+  never-cancelled fallback outside Elio execution. Cancellation propagates
+  one-way through direct lazy-task awaits between Elio tasks; foreign coroutine
+  types, independent spawns, and explicit token parameters remain separate
+  cancellation boundaries. Constructing a task execution context and linking a
+  lazy child can now report allocation failure; the context constructor and
+  `task::await_suspend` are therefore no longer `noexcept`. Requests are
+  best-effort and do not force frame destruction, roll back side effects, or
+  replace a result that already completed.
+- **Structured task groups**: Added scheduler-bound `coro::task_group` and
+  callback-shaped `coro::task_scope()` APIs. Groups propagate parent and group
+  cancellation to children, join every registered child frame, default to
+  fail-fast sibling cancellation, optionally collect all failures without
+  cancelling siblings through `task_group_error`, and can bound concurrently
+  executing child bodies. `task_scope()` runs its body in the group cancellation
+  context, so child fail-fast cancellation can wake a token-aware body, and
+  always cancels and joins children when its body fails. Collect-all scopes
+  aggregate simultaneous body and child failures. Completion and cancellation
+  dispatch preserve the selected scheduler domain; requests from another
+  scheduler are posted asynchronously to avoid reciprocal worker deadlock. A bare
+  group requires an explicit `co_await group.join()`; `join()` returns a direct
+  single-use awaitable instead of creating a nested task and therefore has no
+  child-link allocation window. The group destructor can only request
+  cancellation as a non-joining fallback. Task scopes retain their body
+  callable and captures through child joining, while automatic locals in the
+  returned body coroutine retain normal coroutine lifetime and must not be
+  referenced by children after the body returns. Scheduler-domain operations
+  require an actual worker; the thread that called `scheduler::start()` remains
+  an external caller for cancellation dispatch.
+- **Cancellation-aware basic synchronization waits**: Added explicit
+  `cancel_token` overloads for `mutex::lock()`, `semaphore::acquire()`, and
+  `event::wait()`. Each returns `cancel_result` and uses one terminal wake state
+  so cancellation and normal notification cannot both resume a waiter. A
+  cancellation winner does not acquire a lock or consume a permit; an already
+  completed acquisition remains caller-owned. The corresponding no-token
+  awaiters retain their existing `void` results and lightweight fast paths.
+- **Cancellation-aware shared lock and condition waits**: Added explicit
+  `cancel_token` overloads for shared and exclusive `shared_mutex` acquisition,
+  plus all three `condition_variable` wait modes. Reader/writer counts, writer
+  preference, and notification-versus-cancellation races use the same terminal
+  winner model. A condition wait that released an associated lock re-acquires
+  it before returning either `completed` or `cancelled`; a pre-cancelled wait
+  leaves the already-held lock untouched.
+- **Cancellation-aware channel operations**: Added `cancel_token` overloads for
+  `channel::send()` and `channel::recv()`. Their result objects distinguish
+  cancellation from a closed channel while preserving the existing boolean and
+  optional results on no-token overloads. Cancellation winners do not transfer
+  a pending send value into the channel or consume a received value; send,
+  receive, and close paths skip cancelled waiters without consuming another
+  waiter's wakeup.
+- **Process fork boundary**: Documented the unsupported inherited-runtime
+  continuation path and regression-tested supported single-threaded
+  fork-before-runtime use plus active-runtime parent continuation with child
+  `execve()`/`_exit()`. Elio does not install `pthread_atfork` repair hooks or
+  provide child-side runtime reinitialization. Added a 0.5.x-to-0.6 migration
+  guide covering ownership, cancellation, combinators, I/O integration, RPC,
+  and process lifecycle changes.
 
 ### Fixed
 
@@ -589,6 +656,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads the calling thread's shared completion slot, so an epoll fallback does
   not return stale io_uring state when both backends were compiled in. (#982)
 
+- **Bounded-channel slot publication**: Cancellation-aware sends no longer
+  claim normal completion before a logically freed ring slot is physically
+  reusable, preventing value loss and false closed results. Token-aware receives
+  give an already-selected normal notification one cancellation-immune value
+  acquisition attempt, then restore the caller token if another receiver wins.
+  Deferred refills now drain every reusable credit and wake queued receivers,
+  so no-token and token-aware operations cannot be stranded by out-of-order
+  consumer publication.
+- **Scheduler exception-handler publication**: Concurrent handler replacement,
+  reporting, and getter calls now exchange shared handler snapshots under an
+  explicit mutex instead of relying on `atomic<shared_ptr>`. Reporters and
+  getter callers keep their selected handler alive, while reports invoke it
+  outside the lock. This preserves concurrent replacement and self-replacement
+  without the GCC 12 ThreadSanitizer race.
+- **Cancellation callback teardown**: Destroying or unregistering a callback
+  registration now synchronizes with cancellation that has already selected or
+  started the callback, preventing callback captures from being released while
+  dispatch still uses them. Self-unregistration and same-dispatch removal of a
+  later callback remain deadlock-free. Cross-dispatch teardown requested from
+  inside another cancellation callback is deferred to avoid mutual wait cycles;
+  the callback payload remains alive through dispatch, while external captures
+  still require caller synchronization. Cancellation rethrows the first
+  callback exception after dispatching the remaining callbacks.
+
 ### Changed
 
 - **HTTP response receive compatibility**: unsupported transfer-coding stacks
@@ -748,110 +839,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection diagnostics now use DEBUG instead of the default INFO level
   (#1011).
 
-### Documentation
-
-- Clarified caller responsibility for truthful HEAD/304 representation lengths:
-  framing validation checks syntax and consistency, not a hypothetical GET's
-  actual output. Existing HEAD/304 length-selection rules are unchanged.
-
-- Clarified the `uds_listener` shutdown boundary, aligning it with the
-  `tcp_listener` contract from #1013: `close()` invalidates future accepts but
-  does not cancel an accept already submitted to the I/O backend, so a parked
-  plain `accept()` never wakes on `close()` under either the io_uring or the
-  epoll backend. Stoppable accept loops must use `accept(coro::cancel_token)`,
-  request cancellation, await completion, and only then close or destroy the
-  listener (#1168).
-- Documented that `run()`/`ELIO_ASYNC_MAIN` and `serve()`/`serve_all()` install
-  process-wide `SIG_IGN` for `SIGPIPE` through independent one-time entry paths.
-  Elio does not save or restore the previous disposition; embedders that need a
-  different policy must save it before first use and restore it only after all
-  Elio runtime/server use has ended (#1076).
-- Clarified the `condition_variable::wait(Lock&)` contract: generic lock
-  overloads call `Lock::lock()` synchronously on the resuming thread and require
-  a promptly returning lock suitable for a scheduler worker. A contended
-  `std::mutex` can park and stall the worker; `wait(sync::mutex&)` instead uses
-  the coroutine-aware asynchronous re-lock path (#1073).
-- Clarified the `tcp_listener` shutdown boundary: `close()` invalidates future
-  accepts but does not cancel an accept already submitted to the I/O backend.
-  Stoppable accept loops must use token cancellation, await completion, and
-  only then close or destroy the listener (#1009).
-- Clarified that graceful scheduler shutdown does not stop application service
-  loops by itself. Callers must cancel or wake long-running loops and await
-  completion before an unbounded shutdown, or use a finite timeout and accept
-  force-stop semantics (#1010).
-- Clarified the RDMA operation teardown boundary: cancellation is cooperative,
-  operation awaiters are not token-cancellable, and a suspended operation
-  coroutine must remain alive after delivery wins `pending → completed` until
-  its result is consumed. Completed eager operations without a waiter remain
-  safe to discard.
-
-## [0.6.0] - 2026-07-20
-
-### Added
-
-- **Runtime task cancellation contexts**: Every task execution context now owns
-  cooperative cancellation authority. `join_handle::request_cancel()` remains
-  valid across task completion and frame destruction, while
-  `this_coro::cancel_token()` exposes the active task token with a
-  never-cancelled fallback outside Elio execution. Cancellation propagates
-  one-way through direct lazy-task awaits between Elio tasks; foreign coroutine
-  types, independent spawns, and explicit token parameters remain separate
-  cancellation boundaries. Constructing a task execution context and linking a
-  lazy child can now report allocation failure; the context constructor and
-  `task::await_suspend` are therefore no longer `noexcept`. Requests are
-  best-effort and do not force frame destruction, roll back side effects, or
-  replace a result that already completed.
-- **Structured task groups**: Added scheduler-bound `coro::task_group` and
-  callback-shaped `coro::task_scope()` APIs. Groups propagate parent and group
-  cancellation to children, join every registered child frame, default to
-  fail-fast sibling cancellation, optionally collect all failures without
-  cancelling siblings through `task_group_error`, and can bound concurrently
-  executing child bodies. `task_scope()` runs its body in the group cancellation
-  context, so child fail-fast cancellation can wake a token-aware body, and
-  always cancels and joins children when its body fails. Collect-all scopes
-  aggregate simultaneous body and child failures. Completion and cancellation
-  dispatch preserve the selected scheduler domain; requests from another
-  scheduler are posted asynchronously to avoid reciprocal worker deadlock. A bare
-  group requires an explicit `co_await group.join()`; `join()` returns a direct
-  single-use awaitable instead of creating a nested task and therefore has no
-  child-link allocation window. The group destructor can only request
-  cancellation as a non-joining fallback. Task scopes retain their body
-  callable and captures through child joining, while automatic locals in the
-  returned body coroutine retain normal coroutine lifetime and must not be
-  referenced by children after the body returns. Scheduler-domain operations
-  require an actual worker; the thread that called `scheduler::start()` remains
-  an external caller for cancellation dispatch.
-- **Cancellation-aware basic synchronization waits**: Added explicit
-  `cancel_token` overloads for `mutex::lock()`, `semaphore::acquire()`, and
-  `event::wait()`. Each returns `cancel_result` and uses one terminal wake state
-  so cancellation and normal notification cannot both resume a waiter. A
-  cancellation winner does not acquire a lock or consume a permit; an already
-  completed acquisition remains caller-owned. The corresponding no-token
-  awaiters retain their existing `void` results and lightweight fast paths.
-- **Cancellation-aware shared lock and condition waits**: Added explicit
-  `cancel_token` overloads for shared and exclusive `shared_mutex` acquisition,
-  plus all three `condition_variable` wait modes. Reader/writer counts, writer
-  preference, and notification-versus-cancellation races use the same terminal
-  winner model. A condition wait that released an associated lock re-acquires
-  it before returning either `completed` or `cancelled`; a pre-cancelled wait
-  leaves the already-held lock untouched.
-- **Cancellation-aware channel operations**: Added `cancel_token` overloads for
-  `channel::send()` and `channel::recv()`. Their result objects distinguish
-  cancellation from a closed channel while preserving the existing boolean and
-  optional results on no-token overloads. Cancellation winners do not transfer
-  a pending send value into the channel or consume a received value; send,
-  receive, and close paths skip cancelled waiters without consuming another
-  waiter's wakeup.
-- **Process fork boundary**: Documented the unsupported inherited-runtime
-  continuation path and regression-tested supported single-threaded
-  fork-before-runtime use plus active-runtime parent continuation with child
-  `execve()`/`_exit()`. Elio does not install `pthread_atfork` repair hooks or
-  provide child-side runtime reinitialization. Added a 0.5.x-to-0.6 migration
-  guide covering ownership, cancellation, combinators, I/O integration, RPC,
-  and process lifecycle changes.
-
-### Changed
-
 - **Structured coroutine combinators**: `when_all()`, `when_any()`, and
   `with_timeout()` now return move-only lazy `coro::task` objects and own every
   accepted branch through a scheduler-bound task group instead of detached child
@@ -976,31 +963,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   virtual-stack inspection APIs instead; custom allocation is now independent
   of Elio runtime state.
 
-### Fixed
+### Documentation
 
-- **Bounded-channel slot publication**: Cancellation-aware sends no longer
-  claim normal completion before a logically freed ring slot is physically
-  reusable, preventing value loss and false closed results. Token-aware receives
-  give an already-selected normal notification one cancellation-immune value
-  acquisition attempt, then restore the caller token if another receiver wins.
-  Deferred refills now drain every reusable credit and wake queued receivers,
-  so no-token and token-aware operations cannot be stranded by out-of-order
-  consumer publication.
-- **Scheduler exception-handler publication**: Concurrent handler replacement,
-  reporting, and getter calls now exchange shared handler snapshots under an
-  explicit mutex instead of relying on `atomic<shared_ptr>`. Reporters and
-  getter callers keep their selected handler alive, while reports invoke it
-  outside the lock. This preserves concurrent replacement and self-replacement
-  without the GCC 12 ThreadSanitizer race.
-- **Cancellation callback teardown**: Destroying or unregistering a callback
-  registration now synchronizes with cancellation that has already selected or
-  started the callback, preventing callback captures from being released while
-  dispatch still uses them. Self-unregistration and same-dispatch removal of a
-  later callback remain deadlock-free. Cross-dispatch teardown requested from
-  inside another cancellation callback is deferred to avoid mutual wait cycles;
-  the callback payload remains alive through dispatch, while external captures
-  still require caller synchronization. Cancellation rethrows the first
-  callback exception after dispatching the remaining callbacks.
+- Aligned the public API overview with the exported HTTP class names, timer
+  cancellation overloads, per-worker I/O ownership and sequential high-level
+  HTTP/2 reuse. Completed the HTTP/2 DNS configuration example and corrected
+  the source-tree stream-output contract link (#1294, #1295, #1296).
+
+- Clarified caller responsibility for truthful HEAD/304 representation lengths:
+  framing validation checks syntax and consistency, not a hypothetical GET's
+  actual output. Existing HEAD/304 length-selection rules are unchanged.
+
+- Clarified the `uds_listener` shutdown boundary, aligning it with the
+  `tcp_listener` contract from #1013: `close()` invalidates future accepts but
+  does not cancel an accept already submitted to the I/O backend, so a parked
+  plain `accept()` never wakes on `close()` under either the io_uring or the
+  epoll backend. Stoppable accept loops must use `accept(coro::cancel_token)`,
+  request cancellation, await completion, and only then close or destroy the
+  listener (#1168).
+- Documented that `run()`/`ELIO_ASYNC_MAIN` and `serve()`/`serve_all()` install
+  process-wide `SIG_IGN` for `SIGPIPE` through independent one-time entry paths.
+  Elio does not save or restore the previous disposition; embedders that need a
+  different policy must save it before first use and restore it only after all
+  Elio runtime/server use has ended (#1076).
+- Clarified the `condition_variable::wait(Lock&)` contract: generic lock
+  overloads call `Lock::lock()` synchronously on the resuming thread and require
+  a promptly returning lock suitable for a scheduler worker. A contended
+  `std::mutex` can park and stall the worker; `wait(sync::mutex&)` instead uses
+  the coroutine-aware asynchronous re-lock path (#1073).
+- Clarified the `tcp_listener` shutdown boundary: `close()` invalidates future
+  accepts but does not cancel an accept already submitted to the I/O backend.
+  Stoppable accept loops must use token cancellation, await completion, and
+  only then close or destroy the listener (#1009).
+- Clarified that graceful scheduler shutdown does not stop application service
+  loops by itself. Callers must cancel or wake long-running loops and await
+  completion before an unbounded shutdown, or use a finite timeout and accept
+  force-stop semantics (#1010).
+- Clarified the RDMA operation teardown boundary: cancellation is cooperative,
+  operation awaiters are not token-cancellable, and a suspended operation
+  coroutine must remain alive after delivery wins `pending → completed` until
+  its result is consumed. Completed eager operations without a waiter remain
+  safe to discard.
+
+### Known Limitations
+
+- **Historical HTTP TLS metrics timeout**: The intermittent timeout tracked
+  in [#1219](https://github.com/Coldwings/Elio/issues/1219) remains unclassified
+  because the original sample lacks causal partial-response and server
+  read/deadline evidence. The issue was administratively closed as not planned;
+  subsequent passing runs and fixes for separately classified failures do not
+  establish that the historical timeout was repaired. Reopen on any unmatched
+  recurrence and retain the complete log, tested revision, seed, configuration,
+  partial-response progress and exact read/deadline/cancellation state.
 
 ## [0.5.3] - 2026-07-17
 

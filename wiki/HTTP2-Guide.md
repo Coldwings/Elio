@@ -117,6 +117,8 @@ struct h2_client_config {
     bool rotate_resolved_addresses = true;
     size_t max_response_headers = 100;             // Max accepted field lines per stream
     size_t max_response_header_bytes = 64 * 1024; // Max accepted name/value bytes per stream
+    std::chrono::nanoseconds dns_timeout{0};      // Independent DNS observer budget; <=0 disables
+    std::shared_ptr<net::resolve_domain> dns_domain{}; // Null selects shared default admission
 };
 
 // Usage
@@ -127,6 +129,13 @@ h2_client client(config);
 ```
 
 `connect_timeout` bounds TCP connect and TLS/ALPN handshake setup.
+`dns_timeout` independently bounds observation of a new connection's DNS lookup;
+non-positive values disable that observer deadline. `dns_domain` selects shared
+bounded DNS admission, with a null pointer using the default capacity-64 domain.
+Expiry can end DNS observation while an admitted libc lookup continues until
+reclamation; it does not forcibly interrupt the lookup. This does not add a
+per-request cancellation API to `h2_client`. See
+[Networking](Networking.md#bounded-cancellable-dns-waiting) for that boundary.
 `read_timeout` bounds HTTP/2 session initialization and response waits.
 `max_response_size` bounds the accumulated DATA payload stored in the returned
 `http::response`; responses exceeding the limit fail instead of continuing to

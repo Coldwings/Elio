@@ -2441,7 +2441,7 @@ The result reports closure scope and observations, not proof of peer delivery.
 `read_end_scope()` reports directional EOF for TCP/TLS 1.3, or the selected
 whole-session closure for TLS 1.2. It does not itself close output, probe
 transport capabilities, or turn an error/zero-length read into authenticated EOF.
-See [Finishing Stream Output](API-Contracts#finishing-stream-output) for
+See [Finishing Stream Output](API-Contracts.md#finishing-stream-output) for
 automatic TLS 1.2 closure, ordered ciphertext draining and failure semantics.
 
 TCP connection.

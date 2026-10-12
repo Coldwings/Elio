@@ -256,8 +256,8 @@ elio::
 │   └── tcp                  // TCP client/server
 │
 ├── http::                   // HTTP protocol
-│   ├── http_client          // HTTP/HTTPS client
-│   ├── http_server          // HTTP server
+│   ├── client               // HTTP/HTTPS client
+│   ├── server               // HTTP server
 │   ├── h2_client            // HTTP/2 client
 │   ├── h2_session           // HTTP/2 session (nghttp2)
 │   ├── websocket            // WebSocket client/server

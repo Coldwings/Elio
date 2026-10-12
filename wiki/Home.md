@@ -12,7 +12,7 @@
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Signal Handling**: Coroutine-friendly signal handling via signalfd
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable
-- **Timers**: sleep_for, sleep_until, yield with cancellation support
+- **Timers**: cancellation-aware sleep_for/sleep_until overloads; yield reschedules execution
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
@@ -71,7 +71,7 @@ Elio is built around a few key technical decisions:
   the CMake target so consumers inherit required dependencies such as fmt,
   CMake's Threads target, and enabled feature/backend libraries.
 - **Linux-native**: Deep integration with io_uring and signalfd enables optimal performance on modern Linux kernels. epoll provides a fallback for older systems.
-- **Per-worker I/O**: Each scheduler thread owns its I/O backend (io_uring or epoll), eliminating I/O-related locking entirely. Cross-thread communication uses lock-free MPSC queues on the normal path, with a locked overflow only for sustained full-queue bursts.
+- **Per-worker I/O**: Each scheduler thread owns its I/O backend (io_uring or epoll). Submission and polling stay on that owner, and pending operations retain their worker/backend generation. This ownership does not serialize concurrent access to streams or descriptors. Cross-thread scheduling uses MPSC queues on the normal path, with a locked overflow for sustained full-queue bursts.
 - **Work-stealing**: The Chase-Lev deque provides lock-free local operations with a global load balancing fallback. Tasks with thread affinity are respected during stealing.
 - **Virtual stack tracking**: C++20 stackless coroutines lose stack information at suspension points. Elio's intrusive virtual stack enables production debugging via `elio-pstack` and GDB/LLDB extensions.
 
@@ -89,7 +89,7 @@ Elio is built around a few key technical decisions:
 - [[Byte Streams]] - Publishing-stream composition, ownership, and lifecycle
 - [[HTTP Streaming]] - Owned streaming replies, incremental receive, borrowed buffers,
   framing, and server-owned CONNECT tunnels over TCP or HTTPS proxies
-- [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing
+- [[HTTP2 Guide]] - Sequential client connection reuse and lower-level HTTP/2 sessions
 - [[TLS Configuration]] - TLS/SSL setup and certificate management
 - [[Security Guidelines]] - Library/caller responsibility boundaries, secure
   configuration, and vulnerability reporting guidance

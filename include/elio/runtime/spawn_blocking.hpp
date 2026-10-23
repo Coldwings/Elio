@@ -16,6 +16,11 @@
 namespace elio {
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> pause_blocking_owner_dispatch_for_test{false};
+inline std::atomic<bool> blocking_owner_dispatch_paused_for_test{false};
+#endif
+
 class blocking_admission_error : public std::runtime_error {
 public:
     blocking_admission_error()
@@ -169,6 +174,15 @@ public:
             auto* promise = coro::get_promise_base(caller.address());
             auto owner = promise ? promise->pinned_continuation_owner() : nullptr;
             if (owner) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (pause_blocking_owner_dispatch_for_test.load(std::memory_order_acquire)) {
+                    blocking_owner_dispatch_paused_for_test.store(true, std::memory_order_release);
+                    while (pause_blocking_owner_dispatch_for_test.load(std::memory_order_acquire)) {
+                        pause_blocking_owner_dispatch_for_test.wait(true, std::memory_order_acquire);
+                    }
+                    blocking_owner_dispatch_paused_for_test.store(false, std::memory_order_release);
+                }
+#endif
                 owner->schedule(caller);
             } else if (sched) {
                 if (sched->is_running()) {

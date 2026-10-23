@@ -249,6 +249,16 @@ coro::generator<int> gated_producer(sync::event* gate, bool yield_value) {
     if (yield_value) co_yield 42;
 }
 
+coro::generator<int> leased_producer(std::atomic<bool>* correct) {
+    auto lease = co_await lease_current_worker();
+    const auto owner = std::this_thread::get_id();
+    co_yield 1;
+    correct->store(std::this_thread::get_id() == owner);
+    co_yield 2;
+    correct->store(correct->load() && std::this_thread::get_id() == owner);
+    lease.release();
+}
+
 coro::task<void> acquire_without_worker(bool* rejected) {
     try {
         auto lease = co_await lease_current_worker();
@@ -438,13 +448,14 @@ TEST_CASE("isolated scope returns a leased parent to its owner", "[worker_lease]
 }
 
 TEST_CASE("captured owner endpoint falls back after final lease release", "[worker_lease][scheduler]") {
+    const bool foreign_dispatch = GENERATE(false, true);
     backend_selection backend(io::io_context::backend_type::epoll);
     scheduler sched(2);
     auto* old_owner = sched.get_worker(1);
     std::optional<external_worker_lease> retained;
     std::shared_ptr<coro::detail::continuation_owner> endpoint;
     std::atomic<void*> suspended{nullptr};
-    std::atomic<bool> finished{false};
+    std::atomic<bool> finished{false}, correct_domain{false};
     struct manual_wait {
         std::atomic<void*>* address;
         bool await_ready() const noexcept { return false; }
@@ -458,6 +469,7 @@ TEST_CASE("captured owner endpoint falls back after final lease release", "[work
         retained.emplace(co_await lease_current_worker());
         endpoint = coro::promise_base::current_frame()->pinned_continuation_owner();
         co_await manual_wait{&suspended};
+        correct_domain.store(scheduler::current() == &sched && worker_thread::current() != nullptr);
         finished.store(true, std::memory_order_release);
     });
     const bool parked = eventually([&] { return suspended.load(std::memory_order_acquire) != nullptr; });
@@ -466,13 +478,46 @@ TEST_CASE("captured owner endpoint falls back after final lease release", "[work
     const bool retired = eventually([&] { return !old_owner->is_running(); });
     // Models capture -> final release -> retire -> notifier dispatch, without
     // relying on timing to land between lookup and endpoint invocation.
-    if (parked) endpoint->schedule(std::coroutine_handle<>::from_address(suspended.load()));
+    if (parked) {
+        auto dispatch = [&] {
+            endpoint->schedule(std::coroutine_handle<>::from_address(suspended.load()));
+        };
+        if (foreign_dispatch) { std::thread thread(dispatch); thread.join(); }
+        else dispatch();
+    }
     const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
     if (completed) sched.shutdown();
     else sched.shutdown_force();
     REQUIRE(parked);
     REQUIRE(retired);
     REQUIRE(completed);
+    REQUIRE(correct_domain.load());
+}
+
+TEST_CASE("next restores a leased producer independently of its leased consumer", "[worker_lease][scheduler]") {
+    backend_selection backend(io::io_context::backend_type::epoll);
+    scheduler sched(2);
+    std::atomic<bool> producer_correct{true}, finished{false}, consumer_correct{false};
+    auto producer = leased_producer(&producer_correct);
+    sched.start();
+    sched.go_to(0, [&]() -> coro::task<void> {
+        (void)co_await producer.next();
+        co_await runtime::set_affinity(1);
+        auto consumer_lease = co_await lease_current_worker();
+        const auto consumer_thread = std::this_thread::get_id();
+        (void)co_await producer.next();
+        const bool returned = std::this_thread::get_id() == consumer_thread;
+        (void)co_await producer.next();
+        consumer_correct.store(returned && std::this_thread::get_id() == consumer_thread);
+        consumer_lease.release();
+        finished.store(true, std::memory_order_release);
+    });
+    const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
+    if (completed) sched.shutdown();
+    else sched.shutdown_force();
+    REQUIRE(completed);
+    REQUIRE(consumer_correct.load());
+    REQUIRE(producer_correct.load());
 }
 
 TEST_CASE("generator yield and exhaustion restore a leased consumer", "[worker_lease][scheduler]") {
@@ -575,4 +620,36 @@ TEST_CASE("blocking and timer completions retain leased owners on rejection", "[
     else sched.shutdown_force();
     REQUIRE(completed);
     REQUIRE(correct.load());
+}
+
+TEST_CASE("blocking completion keeps its scheduler after captured lease release", "[worker_lease][scheduler]") {
+    backend_selection backend(io::io_context::backend_type::epoll);
+    scheduler sched(2);
+    auto* old_owner = sched.get_worker(1);
+    std::optional<external_worker_lease> retained;
+    std::atomic<bool> finished{false}, correct_domain{false};
+    elio::detail::blocking_owner_dispatch_paused_for_test.store(false);
+    elio::detail::pause_blocking_owner_dispatch_for_test.store(true);
+    sched.start();
+    sched.go_to(1, [&]() -> coro::task<void> {
+        retained.emplace(co_await lease_current_worker());
+        co_await elio::spawn_blocking([] {});
+        correct_domain.store(scheduler::current() == &sched && worker_thread::current() != nullptr);
+        finished.store(true, std::memory_order_release);
+    });
+    const bool captured = eventually([] {
+        return elio::detail::blocking_owner_dispatch_paused_for_test.load(std::memory_order_acquire);
+    });
+    sched.set_thread_count(1);
+    if (captured) retained->release();
+    const bool retired = eventually([&] { return !old_owner->is_running(); });
+    elio::detail::pause_blocking_owner_dispatch_for_test.store(false, std::memory_order_release);
+    elio::detail::pause_blocking_owner_dispatch_for_test.notify_all();
+    const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
+    if (completed) sched.shutdown();
+    else sched.shutdown_force();
+    REQUIRE(captured);
+    REQUIRE(retired);
+    REQUIRE(completed);
+    REQUIRE(correct_domain.load());
 }

@@ -20,6 +20,10 @@ the parent's thread-affine resources from a scope body that migrates elsewhere.
 Async generators likewise keep an independent producer context, but yield and
 exhaustion restore a leased consumer to its owner. `for_each()`'s internal loop
 shares its Elio caller's context so callbacks and loop return honor that lease.
+If the producer itself holds a lease across yields, `next()` restores the
+producer's owner before executing its body. Settle/exhaust such a producer on
+its owner before destroying its frame: a lease does not make early generator
+destruction asynchronous or move thread-affine resource destructors to an owner.
 An application-provided awaitable that directly resumes on a foreign executor
 must arrange its own owner handoff before thread-affine code runs.
 

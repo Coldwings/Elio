@@ -27,6 +27,7 @@ struct external_worker_wakeup final : coro::detail::continuation_owner {
     mutable std::mutex mutex;
     io::io_context* context = nullptr;
     worker_thread* worker = nullptr;
+    scheduler* domain = nullptr;
 };
 
 // Allocated with the operation, not with its cancellation request. Only the
@@ -89,6 +90,7 @@ public:
     {
         external_wakeup_->context = io_context_.get();
         external_wakeup_->worker = this;
+        external_wakeup_->domain = scheduler_;
     }
 
     ~worker_thread() {
@@ -96,6 +98,7 @@ public:
         std::lock_guard<std::mutex> lock(external_wakeup_->mutex);
         external_wakeup_->context = nullptr;
         external_wakeup_->worker = nullptr;
+        external_wakeup_->domain = nullptr;
     }
 
     worker_thread(const worker_thread&) = delete;

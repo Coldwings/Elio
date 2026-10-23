@@ -1787,11 +1787,20 @@ inline void detail::external_worker_wakeup::schedule(
     std::coroutine_handle<> handle) noexcept {
     std::unique_lock<std::mutex> lock(mutex);
     auto* promise = coro::get_promise_base(handle.address());
-    if (!promise || promise->pinned_continuation_owner().get() != this) {
+    auto current_owner = promise ? promise->pinned_continuation_owner() : nullptr;
+    if (current_owner.get() != this) {
         // The final lease may have been released after the notifier captured
-        // this endpoint. Do not drop an otherwise movable continuation.
-        lock.unlock();
-        schedule_handle(handle);
+        // this endpoint. Retain the original scheduler domain, never the
+        // notifier's TLS/trampoline (which may be a blocking-pool thread).
+        if (current_owner) {
+            lock.unlock();
+            current_owner->schedule(handle);
+            return;
+        }
+        while (domain && domain->is_running()) {
+            if (domain->try_schedule(handle)) return;
+            std::this_thread::yield();
+        }
         return;
     }
     if (!worker) return;

@@ -282,8 +282,9 @@ public:
                 // transferring control back, including after internal I/O.
                 producer.promise().enter_frame_context(
                     promise_base::current_frame());
-                // Symmetric transfer → producer runs until co_yield / end.
-                return producer;
+                // Producer and consumer have independent ownership domains.
+                return detail::transfer_to_continuation(
+                    producer, std::addressof(producer.promise()));
             }
 
             std::optional<T> await_resume() {

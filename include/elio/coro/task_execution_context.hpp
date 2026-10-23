@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <coroutine>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,12 @@ class task_execution_context;
 class promise_base;
 
 namespace detail {
+struct continuation_owner {
+    virtual ~continuation_owner() = default;
+    [[nodiscard]] virtual bool is_current() const noexcept = 0;
+    virtual void schedule(std::coroutine_handle<>) noexcept = 0;
+};
+
 struct task_execution_control_block;
 [[nodiscard]] std::shared_ptr<task_execution_context>
 make_task_execution_context();
@@ -106,6 +113,14 @@ public:
         return active_io_pins_.load(std::memory_order_acquire);
     }
 
+    /// @internal A lease also carries its scheduler domain for foreign wakes.
+    [[nodiscard]] std::shared_ptr<detail::continuation_owner>
+    pinned_continuation_owner() const noexcept {
+        if (continuation_pins_.load(std::memory_order_acquire) == 0) return {};
+        std::lock_guard<std::mutex> lock(io_pin_mutex_);
+        return continuation_owner_;
+    }
+
     [[nodiscard]] bool is_io_pin_owner(
         size_t worker_id, uint64_t context_generation) const noexcept {
         return has_active_io_pin() &&
@@ -151,7 +166,8 @@ private:
         return cancellation_context_.link_parent(std::move(parent));
     }
 
-    void acquire_io_pin(size_t worker_id, uint64_t context_generation) {
+    void acquire_io_pin(size_t worker_id, uint64_t context_generation,
+                        std::shared_ptr<detail::continuation_owner> owner = {}) {
         std::lock_guard<std::mutex> lock(io_pin_mutex_);
         size_t count = active_io_pins_.load(std::memory_order_relaxed);
         if (count != 0 &&
@@ -169,11 +185,16 @@ private:
             io_context_generation_.store(
                 context_generation, std::memory_order_relaxed);
         }
+        if (owner) {
+            continuation_owner_ = std::move(owner);
+            continuation_pins_.fetch_add(1, std::memory_order_release);
+        }
         active_io_pins_.store(count + 1, std::memory_order_release);
     }
 
     void release_io_pin(size_t worker_id,
-                        uint64_t context_generation) noexcept {
+                        uint64_t context_generation,
+                        bool routes_continuation = false) noexcept {
         std::lock_guard<std::mutex> lock(io_pin_mutex_);
         size_t count = active_io_pins_.load(std::memory_order_relaxed);
         const bool valid =
@@ -183,6 +204,11 @@ private:
                 context_generation;
         assert(valid && "I/O operation guard released a mismatched task pin");
         if (!valid) return;
+
+        if (routes_continuation &&
+            continuation_pins_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            continuation_owner_.reset();
+        }
 
         // Owner and generation deliberately remain as the last observed
         // identity when count reaches zero. The count is authoritative, and
@@ -198,6 +224,8 @@ private:
     std::atomic<size_t> io_owner_worker_{NO_AFFINITY};
     std::atomic<uint64_t> io_context_generation_{0};
     std::atomic<size_t> active_io_pins_{0};
+    std::atomic<size_t> continuation_pins_{0};
+    std::shared_ptr<detail::continuation_owner> continuation_owner_;
 };
 
 namespace detail {

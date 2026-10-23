@@ -267,6 +267,13 @@ public:
         return execution_context_;
     }
 
+    /// @internal Lease-aware continuation handoff without materializing policy.
+    [[nodiscard]] std::shared_ptr<detail::continuation_owner>
+    pinned_continuation_owner() const noexcept {
+        return execution_context_
+            ? execution_context_->pinned_continuation_owner() : nullptr;
+    }
+
     /// Bind an unstarted transparent child to the context of the Elio promise
     /// that actually awaits it. A task created outside the awaiter may already
     /// have a provisional independent context; no task body has run yet, so
@@ -472,6 +479,18 @@ static_assert(std::is_standard_layout_v<promise_base>,
 /// The previous virtual-stack frame is restored when control returns to the
 /// resumer.
 namespace detail {
+
+[[nodiscard]] inline std::coroutine_handle<> transfer_to_continuation(
+    std::coroutine_handle<> continuation, promise_base* parent) noexcept {
+    if (continuation && parent) {
+        auto owner = parent->pinned_continuation_owner();
+        if (owner && !owner->is_current()) {
+            owner->schedule(continuation);
+            return std::noop_coroutine();
+        }
+    }
+    return continuation ? continuation : std::noop_coroutine();
+}
 
 class frame_context_scope {
 public:

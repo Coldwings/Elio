@@ -184,6 +184,26 @@ coro::task<void> main_task() {
 
 > **Note:** `go_to()` differs from spawning with `go()` + `co_await set_affinity()`. With `go_to()`, worker affinity is set before the task is scheduled and before it ever runs. A later steal attempt may briefly remove the task from a queue, but the scheduler checks affinity and requeues it instead of running it on the wrong worker. With `go()` + `set_affinity()`, the task may briefly run on any worker before migrating.
 
+#### Worker Lifetime Lease
+
+Include `<elio/runtime/worker_lease.hpp>` (also in `<elio/elio.hpp>`).
+
+```cpp
+auto lease = co_await elio::runtime::lease_current_worker();
+size_t owner = lease.worker_id();
+uint64_t generation = lease.context_generation();
+bool active = lease.active();
+// Settle external work and destroy owner-thread resources before release.
+lease.release();
+```
+
+`external_worker_lease` is move-only with RAII release. It retains the acquiring
+logical task's exact worker through normal shrink/drain, independently of
+caller affinity. Foreign-thread release is supported with serialized access to
+the token. Acquisition rejects retiring workers and shutdown. It does not
+drive an external ring or prevent force shutdown. See [[Worker Leases]] for
+ownership, progress, and teardown rules.
+
 #### `elio::spawn()` - Joinable
 
 Spawn a coroutine and return a `join_handle` to await the result later.

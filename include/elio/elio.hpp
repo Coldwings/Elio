@@ -34,6 +34,7 @@
 #include "runtime/chase_lev_deque.hpp"
 #include "runtime/async_main.hpp"
 #include "runtime/affinity.hpp"
+#include "runtime/worker_lease.hpp"
 #include "runtime/serve.hpp"
 #include "runtime/spawn.hpp"
 #include "runtime/blocking_pool.hpp"

@@ -79,6 +79,7 @@ Elio is built around a few key technical decisions:
 
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
+- [[Worker Leases]] - Lifetime and exact-owner execution for external resources
 - [[API Contracts]] - Per-interface library guarantees and caller
   responsibilities for audit and triage
 - [[Fork Safety]] - Supported process creation boundaries and inherited-runtime restrictions

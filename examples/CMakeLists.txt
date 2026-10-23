@@ -73,6 +73,16 @@ add_executable(thread_affinity thread_affinity.cpp)
 target_link_libraries(thread_affinity PRIVATE elio)
 target_link_options(thread_affinity PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(worker_lease worker_lease.cpp)
+target_link_libraries(worker_lease PRIVATE elio)
+target_link_options(worker_lease PRIVATE ${STATIC_LINK_FLAGS})
+if(ELIO_BUILD_TESTS)
+    add_test(NAME worker_lease_example COMMAND worker_lease)
+    set_tests_properties(worker_lease_example PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "Owner cleanup on worker 1")
+    add_dependencies(test_all worker_lease)
+endif()
+
 add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE elio)
 target_link_options(benchmark PRIVATE ${STATIC_LINK_FLAGS})

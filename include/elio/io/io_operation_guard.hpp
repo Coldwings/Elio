@@ -22,7 +22,8 @@ public:
 
     io_operation_guard(
         std::shared_ptr<coro::task_execution_context> execution_context,
-        std::shared_ptr<io_context_identity> identity)
+        std::shared_ptr<io_context_identity> identity,
+        std::shared_ptr<coro::detail::continuation_owner> owner = {})
         : execution_context_(std::move(execution_context))
         , identity_(std::move(identity)) {
         if (!identity_) {
@@ -32,8 +33,10 @@ public:
 
         if (identity_->is_worker_owned()) {
             if (execution_context_) {
+                routes_continuation_ = bool(owner);
                 execution_context_->acquire_io_pin(
-                    identity_->owner_worker_id, identity_->generation);
+                    identity_->owner_worker_id, identity_->generation,
+                    std::move(owner));
                 task_pinned_ = true;
             }
         }
@@ -69,12 +72,14 @@ public:
         // during the release transition.
         if (task_pinned_) {
             execution_context_->release_io_pin(
-                identity_->owner_worker_id, identity_->generation);
+                identity_->owner_worker_id, identity_->generation,
+                routes_continuation_);
         }
         identity_->active_pins.fetch_sub(1, std::memory_order_acq_rel);
 
         active_ = false;
         task_pinned_ = false;
+        routes_continuation_ = false;
         execution_context_.reset();
         identity_.reset();
     }
@@ -89,12 +94,14 @@ private:
         identity_ = std::move(other.identity_);
         active_ = std::exchange(other.active_, false);
         task_pinned_ = std::exchange(other.task_pinned_, false);
+        routes_continuation_ = std::exchange(other.routes_continuation_, false);
     }
 
     std::shared_ptr<coro::task_execution_context> execution_context_;
     std::shared_ptr<io_context_identity> identity_;
     bool active_ = false;
     bool task_pinned_ = false;
+    bool routes_continuation_ = false;
 };
 
 } // namespace elio::io::detail

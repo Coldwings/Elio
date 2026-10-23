@@ -74,6 +74,17 @@ struct final_awaiter {
         h.promise().unlink_parent_cancellation();
         h.promise().leave_frame_context();
         if (continuation) {
+            // Cancellation-isolated scopes may execute elsewhere; returning
+            // from one must restore a still-leased parent's exact owner.
+            if (h.promise().direct_await_context_isolated()) {
+                if (auto* parent = h.promise().parent()) {
+                    auto owner = parent->pinned_continuation_owner();
+                    if (owner && !owner->is_current()) {
+                        owner->schedule(continuation);
+                        return std::noop_coroutine();
+                    }
+                }
+            }
             return continuation;
         } else if (h.promise().detached_) {
             // Keep the externally owned join state after freeing the frame so

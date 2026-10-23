@@ -17,11 +17,16 @@
 namespace elio::runtime {
 
 class scheduler;
+class worker_thread;
 
 namespace detail {
-struct external_worker_wakeup {
-    std::mutex mutex;
+struct external_worker_wakeup final : coro::detail::continuation_owner {
+    [[nodiscard]] bool is_current() const noexcept override;
+    void schedule(std::coroutine_handle<> handle) noexcept override;
+
+    mutable std::mutex mutex;
     io::io_context* context = nullptr;
+    worker_thread* worker = nullptr;
 };
 
 // Allocated with the operation, not with its cancellation request. Only the
@@ -83,12 +88,14 @@ public:
 #endif
     {
         external_wakeup_->context = io_context_.get();
+        external_wakeup_->worker = this;
     }
 
     ~worker_thread() {
         stop();
         std::lock_guard<std::mutex> lock(external_wakeup_->mutex);
         external_wakeup_->context = nullptr;
+        external_wakeup_->worker = nullptr;
     }
 
     worker_thread(const worker_thread&) = delete;

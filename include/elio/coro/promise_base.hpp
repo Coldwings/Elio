@@ -267,6 +267,13 @@ public:
         return execution_context_;
     }
 
+    /// @internal Lease-aware continuation handoff without materializing policy.
+    [[nodiscard]] std::shared_ptr<detail::continuation_owner>
+    pinned_continuation_owner() const noexcept {
+        return execution_context_
+            ? execution_context_->pinned_continuation_owner() : nullptr;
+    }
+
     /// Bind an unstarted transparent child to the context of the Elio promise
     /// that actually awaits it. A task created outside the awaiter may already
     /// have a provisional independent context; no task body has run yet, so

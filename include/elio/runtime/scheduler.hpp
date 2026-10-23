@@ -1658,6 +1658,14 @@ inline scheduler* get_current_scheduler() noexcept {
 inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     if (!handle) return;
 
+    // A foreign notifier's TLS scheduler is not the lease's scheduler domain.
+    if (auto* promise = coro::get_promise_base(handle.address())) {
+        if (auto owner = promise->pinned_continuation_owner()) {
+            owner->schedule(handle);
+            return;
+        }
+    }
+
     auto* sched = scheduler::current();
     if (sched) {
         // Rejection leaves this borrowed handle live. Prefer normal routing;
@@ -1770,6 +1778,33 @@ inline void worker_thread::start() {
     thread_ = std::thread(&worker_thread::run, this);
 }
 
+inline bool detail::external_worker_wakeup::is_current() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    return worker && worker_thread::current() == worker;
+}
+
+inline void detail::external_worker_wakeup::schedule(
+    std::coroutine_handle<> handle) noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    auto* promise = coro::get_promise_base(handle.address());
+    if (!promise || promise->pinned_continuation_owner().get() != this) {
+        // The final lease may have been released after the notifier captured
+        // this endpoint. Do not drop an otherwise movable continuation.
+        lock.unlock();
+        schedule_handle(handle);
+        return;
+    }
+    if (!worker) return;
+    if (worker_thread::current() == worker) {
+        worker->schedule_local(handle);
+        return;
+    }
+    while (worker->is_running()) {
+        if (worker->schedule(handle)) return;
+        std::this_thread::yield();
+    }
+}
+
 inline io::detail::io_operation_guard worker_thread::acquire_external_lease(
     std::shared_ptr<coro::task_execution_context> execution_context) {
     if (current() != this || !execution_context) {
@@ -1783,7 +1818,8 @@ inline io::detail::io_operation_guard worker_thread::acquire_external_lease(
         throw std::runtime_error("worker lease admission is closed");
     }
     return io::detail::io_operation_guard(
-        std::move(execution_context), io_context_->operation_identity());
+        std::move(execution_context), io_context_->operation_identity(),
+        external_wakeup_);
 }
 
 inline void worker_thread::request_stop() noexcept {

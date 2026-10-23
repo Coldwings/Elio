@@ -12,6 +12,14 @@ The acquiring logical task, including directly awaited Elio child frames,
 continues to execute on that exact owner. Independent spawned roots do not
 inherit the lease's execution constraint.
 
+Foreign-thread event notifications and cancellation wakeups return the leased
+task to its retained scheduler/worker, not the notifier's scheduler. An isolated
+`task_scope()` keeps its own cancellation and placement context and may migrate;
+its return restores a still-leased parent to the parent's owner. Do not access
+the parent's thread-affine resources from a scope body that migrates elsewhere.
+An application-provided awaitable that directly resumes on a foreign executor
+must arrange its own owner handoff before thread-affine code runs.
+
 ```cpp
 auto owner = co_await elio::runtime::lease_current_worker();
 // Initialize an external owner on this thread.

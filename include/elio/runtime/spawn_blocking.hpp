@@ -166,7 +166,11 @@ public:
 
             // We claimed resume rights.  The destructor will spin-wait until
             // we store kDone, so the frame stays alive throughout this block.
-            if (sched) {
+            auto* promise = coro::get_promise_base(caller.address());
+            auto owner = promise ? promise->pinned_continuation_owner() : nullptr;
+            if (owner) {
+                owner->schedule(caller);
+            } else if (sched) {
                 if (sched->is_running()) {
                     // A live worker accepts through its bounded inbox or
                     // overflow queue. shutdown_force() drains accepted pool
@@ -176,7 +180,6 @@ public:
                 }
             } else if (caller && !caller.done()) {
                 inline_resume_guard guard(state.get());
-                auto* promise = coro::get_promise_base(caller.address());
                 coro::detail::frame_context_scope frame_scope(promise);
                 caller.resume();
             }

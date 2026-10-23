@@ -4,6 +4,7 @@
 #include <elio/coro/task_group.hpp>
 #include <elio/coro/generator.hpp>
 #include <elio/runtime/affinity.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 #include <atomic>
@@ -510,4 +511,68 @@ TEST_CASE("generator yield and exhaustion restore a leased consumer", "[worker_l
     REQUIRE(completed);
     REQUIRE(correct.load());
     REQUIRE(callback_correct.load());
+}
+
+TEST_CASE("task group rejection fallback cannot resume a leased joiner off-owner", "[worker_lease][scheduler]") {
+    backend_selection backend(io::io_context::backend_type::epoll);
+    scheduler sched(2);
+    sync::event gate;
+    std::atomic<bool> child_waiting{false}, finished{false}, correct{false};
+    sched.start();
+    sched.go_to(1, [&]() -> coro::task<void> {
+        auto lease = co_await lease_current_worker();
+        const auto owner = std::this_thread::get_id();
+        coro::task_group group(sched);
+        group.spawn([&]() -> coro::task<void> {
+            co_await runtime::set_affinity(0);
+            child_waiting.store(true, std::memory_order_release);
+            co_await gate.wait();
+            runtime::detail::reject_next_schedule_for_test.store(true);
+        });
+        co_await group.join();
+        correct.store(std::this_thread::get_id() == owner);
+        lease.release();
+        finished.store(true, std::memory_order_release);
+    });
+    const bool child_started = eventually([&] { return child_waiting.load(std::memory_order_acquire); });
+    const bool parent_waiting = eventually([&] { return sched.get_worker(1)->is_idle(); });
+    gate.set();
+    const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
+    runtime::detail::reject_next_schedule_for_test.store(false);
+    if (completed) sched.shutdown();
+    else sched.shutdown_force();
+    REQUIRE(child_started);
+    REQUIRE(parent_waiting);
+    REQUIRE(completed);
+    REQUIRE(correct.load());
+}
+
+TEST_CASE("blocking and timer completions retain leased owners on rejection", "[worker_lease][scheduler]") {
+    const bool timer_fallback = GENERATE(false, true);
+    backend_selection backend(io::io_context::backend_type::epoll);
+    scheduler sched(1);
+    std::atomic<bool> finished{false}, correct{false};
+    sched.start();
+    sched.go([&]() -> coro::task<void> {
+        auto lease = co_await lease_current_worker();
+        const auto owner = std::this_thread::get_id();
+        if (timer_fallback) {
+            time::detail::reject_next_timeout_prepare_for_test();
+            runtime::detail::reject_next_schedule_for_test.store(true);
+            co_await time::sleep_for(1ms);
+        } else {
+            co_await elio::spawn_blocking([] {
+                runtime::detail::reject_next_schedule_for_test.store(true);
+            });
+        }
+        correct.store(std::this_thread::get_id() == owner);
+        lease.release();
+        finished.store(true, std::memory_order_release);
+    });
+    const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
+    runtime::detail::reject_next_schedule_for_test.store(false);
+    if (completed) sched.shutdown();
+    else sched.shutdown_force();
+    REQUIRE(completed);
+    REQUIRE(correct.load());
 }

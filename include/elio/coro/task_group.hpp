@@ -87,6 +87,12 @@ inline void resume_task_group_join_waiter(
     if (!waiter) {
         return;
     }
+    if (auto* promise = get_promise_base(waiter.address())) {
+        if (auto owner = promise->pinned_continuation_owner()) {
+            owner->schedule(waiter);
+            return;
+        }
+    }
     if (completion.scheduler->try_schedule(waiter)) {
         return;
     }

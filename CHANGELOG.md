@@ -12,7 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Move-only worker lifetime leases for external thread-affine owners. Lease
   acquisition retains exact-owner continuations and worker drain accounting;
   release safely wakes retirement, including from a foreign thread. Retiring
-  workers service requeued owner tasks in bounded turns (#1301).
+  workers service requeued owner tasks in bounded turns. Foreign wakeups,
+  isolated-scope returns, generator consumers, and blocking/timer/group
+  completion paths honor the retained owner (#1301).
 
 ## [0.6.0] - 2026-10-12
 

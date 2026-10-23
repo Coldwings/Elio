@@ -96,6 +96,11 @@ inline bool submit_blocking(F&& work) {
 inline void resume_via_scheduler(std::coroutine_handle<> handle,
                                  runtime::scheduler* sched) noexcept {
     if (!handle) return;
+    auto* promise = coro::get_promise_base(handle.address());
+    if (auto owner = promise ? promise->pinned_continuation_owner() : nullptr) {
+        owner->schedule(handle);
+        return;
+    }
     if (sched) {
         if (sched->is_running() && sched->try_schedule(handle)) {
             return;
@@ -105,7 +110,6 @@ inline void resume_via_scheduler(std::coroutine_handle<> handle,
         return;
     }
     if (!handle.done()) {
-        auto* promise = coro::get_promise_base(handle.address());
         coro::detail::frame_context_scope frame_scope(promise);
         handle.resume();
     }

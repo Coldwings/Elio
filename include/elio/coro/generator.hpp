@@ -27,7 +27,8 @@ namespace detail {
 /// Minimal coroutine type for generator::for_each implementation.
 /// Acts as both the coroutine return type and an awaitable.
 struct for_each_task {
-    struct promise_type {
+    struct promise_type : promise_base {
+        promise_type() : promise_base(defer_nested_task_context) {}
         std::exception_ptr exception_;
         std::coroutine_handle<> consumer_;
 
@@ -44,10 +45,8 @@ struct for_each_task {
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
                     auto consumer = h.promise().consumer_;
-                    if (consumer) {
-                        return consumer;
-                    }
-                    return std::noop_coroutine();
+                    h.promise().leave_frame_context();
+                    return transfer_to_continuation(consumer, h.promise().parent());
                 }
                 void await_resume() const noexcept {}
             };
@@ -64,7 +63,9 @@ struct for_each_task {
     using handle_type = std::coroutine_handle<promise_type>;
     handle_type handle_;
 
-    for_each_task(handle_type h) noexcept : handle_(h) {}
+    for_each_task(handle_type h) noexcept : handle_(h) {
+        handle_.promise().leave_creation_context();
+    }
 
     for_each_task(for_each_task&& other) noexcept
         : handle_(std::exchange(other.handle_, nullptr)) {}
@@ -82,9 +83,20 @@ struct for_each_task {
         return !handle_ || handle_.done();
     }
 
+    template<typename ConsumerPromise>
     [[nodiscard]] std::coroutine_handle<> await_suspend(
-        std::coroutine_handle<> consumer) noexcept {
-        handle_.promise().consumer_ = consumer;
+        std::coroutine_handle<ConsumerPromise> consumer) {
+        auto& promise = handle_.promise();
+        promise_base* parent = nullptr;
+        if constexpr (std::is_convertible_v<ConsumerPromise*, promise_base*>) {
+            parent = std::addressof(consumer.promise());
+            parent->ensure_independent_execution_context();
+            promise.bind_direct_await_context(parent->execution_context());
+        } else {
+            promise.ensure_independent_execution_context();
+        }
+        promise.enter_frame_context(parent);
+        promise.consumer_ = consumer;
         return handle_;  // symmetric transfer to the loop coroutine
     }
 
@@ -182,10 +194,7 @@ public:
                     auto& promise = h.promise();
                     auto consumer = promise.consumer_;
                     promise.leave_frame_context();
-                    if (consumer) {
-                        return consumer;  // symmetric transfer → consumer
-                    }
-                    return std::noop_coroutine();
+                    return detail::transfer_to_continuation(consumer, promise.parent());
                 }
 
                 void await_resume() const noexcept {}
@@ -206,7 +215,7 @@ public:
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
                     h.promise().leave_frame_context();
-                    return consumer;  // symmetric transfer → consumer
+                    return detail::transfer_to_continuation(consumer, h.promise().parent());
                 }
 
                 void await_resume() noexcept {}

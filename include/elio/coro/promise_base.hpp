@@ -480,6 +480,18 @@ static_assert(std::is_standard_layout_v<promise_base>,
 /// resumer.
 namespace detail {
 
+[[nodiscard]] inline std::coroutine_handle<> transfer_to_continuation(
+    std::coroutine_handle<> continuation, promise_base* parent) noexcept {
+    if (continuation && parent) {
+        auto owner = parent->pinned_continuation_owner();
+        if (owner && !owner->is_current()) {
+            owner->schedule(continuation);
+            return std::noop_coroutine();
+        }
+    }
+    return continuation ? continuation : std::noop_coroutine();
+}
+
 class frame_context_scope {
 public:
     explicit frame_context_scope(promise_base* frame) noexcept

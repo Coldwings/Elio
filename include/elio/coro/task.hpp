@@ -77,13 +77,8 @@ struct final_awaiter {
             // Cancellation-isolated scopes may execute elsewhere; returning
             // from one must restore a still-leased parent's exact owner.
             if (h.promise().direct_await_context_isolated()) {
-                if (auto* parent = h.promise().parent()) {
-                    auto owner = parent->pinned_continuation_owner();
-                    if (owner && !owner->is_current()) {
-                        owner->schedule(continuation);
-                        return std::noop_coroutine();
-                    }
-                }
+                return transfer_to_continuation(
+                    continuation, h.promise().parent());
             }
             return continuation;
         } else if (h.promise().detached_) {

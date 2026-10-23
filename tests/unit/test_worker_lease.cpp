@@ -2,6 +2,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/runtime/worker_lease.hpp>
 #include <elio/coro/task_group.hpp>
+#include <elio/coro/generator.hpp>
 #include <elio/runtime/affinity.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
@@ -242,6 +243,11 @@ TEST_CASE("graceful shutdown waits for independent lease release", "[worker_leas
 }
 
 namespace {
+coro::generator<int> gated_producer(sync::event* gate, bool yield_value) {
+    co_await gate->wait();
+    if (yield_value) co_yield 42;
+}
+
 coro::task<void> acquire_without_worker(bool* rejected) {
     try {
         auto lease = co_await lease_current_worker();
@@ -466,4 +472,42 @@ TEST_CASE("captured owner endpoint falls back after final lease release", "[work
     REQUIRE(parked);
     REQUIRE(retired);
     REQUIRE(completed);
+}
+
+TEST_CASE("generator yield and exhaustion restore a leased consumer", "[worker_lease][scheduler]") {
+    const bool yield_value = GENERATE(false, true);
+    const bool for_each = GENERATE(false, true);
+    backend_selection backend(io::io_context::backend_type::epoll);
+    scheduler sched(2);
+    sync::event gate;
+    auto producer = gated_producer(&gate, yield_value);
+    std::atomic<bool> started{false}, finished{false}, correct{false}, callback_correct{true};
+    sched.start();
+    sched.go_to(1, [&]() -> coro::task<void> {
+        auto lease = co_await lease_current_worker();
+        const auto owner = std::this_thread::get_id();
+        started.store(true, std::memory_order_release);
+        if (for_each) {
+            co_await producer.for_each([&](int) {
+                callback_correct.store(std::this_thread::get_id() == owner);
+            });
+        } else {
+            (void)co_await producer.next();
+        }
+        correct.store(std::this_thread::get_id() == owner);
+        lease.release();
+        finished.store(true, std::memory_order_release);
+    });
+    const bool entered = eventually([&] { return started.load(std::memory_order_acquire); });
+    const bool suspended = eventually([&] { return sched.get_worker(1)->is_idle(); });
+    sched.set_thread_count(1);
+    gate.set();
+    const bool completed = eventually([&] { return finished.load(std::memory_order_acquire); });
+    if (completed) sched.shutdown();
+    else sched.shutdown_force();
+    REQUIRE(entered);
+    REQUIRE(suspended);
+    REQUIRE(completed);
+    REQUIRE(correct.load());
+    REQUIRE(callback_correct.load());
 }

@@ -17,6 +17,9 @@ task to its retained scheduler/worker, not the notifier's scheduler. An isolated
 `task_scope()` keeps its own cancellation and placement context and may migrate;
 its return restores a still-leased parent to the parent's owner. Do not access
 the parent's thread-affine resources from a scope body that migrates elsewhere.
+Async generators likewise keep an independent producer context, but yield and
+exhaustion restore a leased consumer to its owner. `for_each()`'s internal loop
+shares its Elio caller's context so callbacks and loop return honor that lease.
 An application-provided awaitable that directly resumes on a foreign executor
 must arrange its own owner handoff before thread-affine code runs.
 

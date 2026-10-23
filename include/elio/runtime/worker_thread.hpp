@@ -19,6 +19,11 @@ namespace elio::runtime {
 class scheduler;
 
 namespace detail {
+struct external_worker_wakeup {
+    std::mutex mutex;
+    io::io_context* context = nullptr;
+};
+
 // Allocated with the operation, not with its cancellation request. Only the
 // owner reads next/keep_alive after publication; attempt returns false when
 // admission must be retried after a backend poll.
@@ -57,6 +62,7 @@ inline std::atomic<io::io_context::backend_type> worker_io_backend_for_test{
 /// of rejecting accepted worker-bound resumptions.
 class worker_thread {
     friend class scheduler;
+    friend class lease_current_worker_awaitable;
 
 public:
     worker_thread(scheduler* sched, size_t worker_id,
@@ -71,14 +77,18 @@ public:
         , io_context_(io::io_context::make_worker_owned(
               worker_id,
               detail::worker_io_backend_for_test.load(
-                  std::memory_order_acquire))) {
+                  std::memory_order_acquire)))
 #else
-        , io_context_(io::io_context::make_worker_owned(worker_id)) {
+        , io_context_(io::io_context::make_worker_owned(worker_id))
 #endif
+    {
+        external_wakeup_->context = io_context_.get();
     }
 
     ~worker_thread() {
         stop();
+        std::lock_guard<std::mutex> lock(external_wakeup_->mutex);
+        external_wakeup_->context = nullptr;
     }
 
     worker_thread(const worker_thread&) = delete;
@@ -299,7 +309,10 @@ public:
     }
 
     void enter_draining_mode() noexcept {
-        draining_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(schedule_mutex_);
+            draining_.store(true, std::memory_order_release);
+        }
         wake();
     }
 
@@ -431,6 +444,8 @@ private:
     }
 
     void run();
+    [[nodiscard]] io::detail::io_operation_guard acquire_external_lease(
+        std::shared_ptr<coro::task_execution_context> execution_context);
     void drain_inbox() noexcept;
     void service_maintenance() noexcept;
     void abandon_maintenance() noexcept;
@@ -505,6 +520,8 @@ private:
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context
+    std::shared_ptr<detail::external_worker_wakeup> external_wakeup_{
+        std::make_shared<detail::external_worker_wakeup>()};
     
     static inline thread_local worker_thread* current_worker_ = nullptr;
 };

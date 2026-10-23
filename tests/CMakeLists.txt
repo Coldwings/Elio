@@ -54,6 +54,7 @@ set(TEST_SOURCES
     unit/test_chase_lev_deque.cpp
     unit/test_scheduler.cpp
     unit/test_scheduler_shutdown.cpp
+    unit/test_worker_lease.cpp
     unit/test_blocking_pool.cpp
     unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
@@ -358,6 +359,11 @@ target_link_libraries(elio_core_sse_writer_compile PRIVATE elio Catch2::Catch2)
 target_compile_definitions(elio_core_sse_writer_compile PRIVATE ELIO_DEBUG)
 
 add_executable(elio_tests ${TEST_SOURCES})
+add_executable(elio_worker_lease_tests unit/test_worker_lease.cpp)
+target_link_libraries(elio_worker_lease_tests PRIVATE elio Catch2::Catch2WithMain)
+target_compile_definitions(elio_worker_lease_tests PRIVATE ELIO_DEBUG ELIO_RUNTIME_TEST_HOOKS)
+add_test(NAME worker_lease COMMAND elio_worker_lease_tests)
+set_tests_properties(worker_lease PROPERTIES TIMEOUT 120)
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_http)
     target_link_libraries(elio_tests PRIVATE elio_http)
@@ -619,7 +625,7 @@ add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
-add_dependencies(test_all elio_tests ${ELIO_ADDITIONAL_TEST_TARGETS})
+add_dependencies(test_all elio_tests elio_worker_lease_tests ${ELIO_ADDITIONAL_TEST_TARGETS})
 
 # CTest also invokes these executables directly or through script fixtures.
 # Optional targets must not introduce dependencies when their feature is off.

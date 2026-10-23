@@ -319,7 +319,7 @@ their corresponding feature targets.
 - **Coroutine/runtime**: `hello_world.cpp`, `chained_coroutines.cpp`,
   `exception_handling.cpp`, `join_destroyed_async.cpp`, `join_wait.cpp`, `parallel_tasks.cpp`,
   `dynamic_threads.cpp`,
-  `autoscaler_example.cpp`, `thread_affinity.cpp`, `signal_handling.cpp`,
+  `autoscaler_example.cpp`, `thread_affinity.cpp`, `worker_lease.cpp`, `signal_handling.cpp`,
   `debug_test.cpp`
 - **Benchmarks**: `benchmark.cpp`, `quick_benchmark.cpp`, `microbench.cpp`,
   `scheduler_service_benchmark.cpp`, `io_benchmark.cpp`,
@@ -427,6 +427,11 @@ size_t executed = sched.total_tasks_executed();
 // Shutdown (waits for completion)
 sched.shutdown();
 ```
+
+External thread-affine owners can acquire a
+[worker lifetime lease](wiki/Worker-Leases.md) from an Elio coroutine to retain
+their worker through normal pool shrink and drain. Affinity alone does not
+provide that lifetime guarantee.
 
 Scheduler execution metrics are published from worker-local counters. Optional
 autoscaler `on_block` detection samples those counters at `tick_interval`, so

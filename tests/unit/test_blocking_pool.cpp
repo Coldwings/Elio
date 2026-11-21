@@ -10,6 +10,7 @@
 #include <chrono>
 #include <memory>
 #include <thread>
+#include <system_error>
 
 #include "../test_main.cpp"  // For scaled_ms / scaled_sec
 
@@ -18,6 +19,26 @@ using namespace elio::coro;
 using namespace elio::time;
 using namespace elio::test;
 using namespace std::chrono_literals;
+
+TEST_CASE("blocking_pool joins already-started workers on construction failure",
+          "[blocking_pool][startup-rollback]") {
+    static thread_local std::weak_ptr<void> state;
+    struct reset_hook {
+        ~reset_hook() { elio::runtime::detail::before_pool_thread_start_for_test = nullptr; }
+    } reset;
+    elio::runtime::detail::before_pool_thread_start_for_test = [](
+            size_t index, std::latch& started, std::weak_ptr<void> current) {
+        if (index != 2) return;
+        state = current;
+        // Account for the thread that won't be created. Observe the first
+        // two workers starting before failing, without relying on timing.
+        started.count_down();
+        started.wait();
+        throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+    };
+    REQUIRE_THROWS_AS(blocking_pool(3), std::system_error);
+    CHECK(state.expired());
+}
 
 TEST_CASE("blocking_pool::submit rejects after shutdown",
           "[blocking_pool][shutdown]") {

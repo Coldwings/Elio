@@ -12,6 +12,13 @@
 
 namespace elio::runtime {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline thread_local void (*before_pool_thread_start_for_test)(
+    size_t, std::latch&, std::weak_ptr<void>) = nullptr;
+}
+#endif
+
 // A simple thread pool for executing blocking tasks.
 // Supports both pooled mode (fixed threads) and non-pooled mode (spawn per task).
 class blocking_pool {
@@ -33,11 +40,22 @@ public:
         auto state = state_;
         state->threads.reserve(num_threads);
         std::latch ready(static_cast<std::ptrdiff_t>(num_threads));
-        for (size_t i = 0; i < num_threads; ++i) {
-            state->threads.emplace_back([state, &ready] {
-                ready.count_down();
-                worker_loop(state);
-            });
+        try {
+            for (size_t i = 0; i < num_threads; ++i) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::before_pool_thread_start_for_test)
+                    hook(i, ready, state);
+#endif
+                state->threads.emplace_back([state, &ready] {
+                    ready.count_down();
+                    worker_loop(state);
+                });
+            }
+        } catch (...) {
+            // The pool isn't published, so no tasks need draining. Join while
+            // ready is still alive, including workers not yet scheduled.
+            stop_and_join(*state);
+            throw;
         }
         ready.wait();
     }
@@ -114,21 +132,7 @@ public:
     // After shutdown() returns, submit() will reject all further submissions.
     void shutdown() {
         auto state = state_;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->stopped.exchange(true, std::memory_order_release)) return;
-        }
-        state->cv.notify_all();
-
-        const auto self = std::this_thread::get_id();
-        for (auto& t : state->threads) {
-            if (!t.joinable()) continue;
-            if (t.get_id() == self) {
-                t.detach();
-            } else {
-                t.join();
-            }
-        }
+        if (!stop_and_join(*state)) return;
         // Drain any leftover tasks inline. Running them here (rather than
         // discarding) keeps the "submitted task always runs" contract that
         // spawn_blocking awaiters rely on for resumption.
@@ -143,6 +147,21 @@ public:
     }
 
 private:
+    static bool stop_and_join(shared_state& state) {
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.stopped.exchange(true, std::memory_order_release)) return false;
+        }
+        state.cv.notify_all();
+        const auto self = std::this_thread::get_id();
+        for (auto& thread : state.threads) {
+            if (!thread.joinable()) continue;
+            if (thread.get_id() == self) thread.detach();
+            else thread.join();
+        }
+        return true;
+    }
+
     static void worker_loop(std::shared_ptr<shared_state> state) {
         while (!state->stopped.load(std::memory_order_relaxed)) {
             std::function<void()> task;

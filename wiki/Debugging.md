@@ -292,8 +292,14 @@ available function names and source locations, not arguments, locals or
 process memory. Up to 32 threads and 24 frames per thread are reported for
 each distinct monitored signal. Optimized builds may have incomplete
 symbols. If tracing is unavailable the log says so and the test runs
-directly; a failed test is not retried. Sanitizer jobs keep their usual
-reports without a debugger. A Catch source line alone is not a fault PC.
+directly; a failed test is not retried. A five-second stack collection
+limit interrupts the debugger, not the test. A partial stack can therefore
+be followed by the test's own signal handler and exit status. If the
+debugger cannot resume within another five seconds, the supervisor ends
+the run as a CI failure (125), not a native result. A separate deadline
+20 seconds beyond the CI watchdog budget covers stalls outside collection.
+Neither deadline changes the test's own alarm. Sanitizer jobs keep their
+usual reports without a debugger. A Catch source line alone is not a fault PC.
 
 When chasing an intermittent full-suite failure, run the test binary through
 `tools/capture-test-evidence.py` before rerunning. The wrapper preserves the

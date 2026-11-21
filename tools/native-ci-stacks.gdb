@@ -15,6 +15,18 @@ import signal
 import gdb
 
 seen = set()
+active_capture = False
+
+class CaptureExpired(Exception):
+    pass
+
+def interrupt_capture(_signum, _frame):
+    # Directed to the debugger, not the target. A late request outside
+    # formatting must not interrupt restoration or the next continue.
+    if active_capture:
+        raise CaptureExpired()
+
+signal.signal(signal.SIGUSR1, interrupt_capture)
 
 def label(value):
     return ascii(value[:180])
@@ -23,12 +35,19 @@ def emit(text):
     gdb.write("[native-ci] " + text + "\n")
 
 def record_stacks():
-    original = gdb.selected_thread()
+    global active_capture
     try:
+        original = gdb.selected_thread()
         signum = int(gdb.parse_and_eval("$_siginfo.si_signo"))
-        if signum in seen:
-            return
-        seen.add(signum)
+    except gdb.error:
+        emit("signal stop information unavailable")
+        return
+    if signum in seen:
+        return
+    seen.add(signum)
+    try:
+        active_capture = True
+        os.write(ready, b"B")
         threads = gdb.selected_inferior().threads()
         emit(f"signal={signal.Signals(signum).name} thread_count={len(threads)}")
         # Always include the signalled thread, even when the cap is reached.
@@ -52,14 +71,18 @@ def record_stacks():
                 emit("  stack unavailable or incomplete")
         if len(ordered) > 32:
             emit("additional threads omitted")
+    except CaptureExpired:
+        emit("stack collection incomplete: time limit reached")
     except Exception as error:
         emit("stack collection unavailable: " + type(error).__name__)
     finally:
+        active_capture = False
         try:
             if original is not None and original.is_valid():
                 original.switch()
         except gdb.error:
             emit("signalled thread no longer available")
+        os.write(ready, b"E")
 end
 
 catch signal SIGALRM SIGSEGV SIGABRT SIGBUS SIGILL SIGFPE SIGSYS SIGQUIT SIGINT
@@ -73,7 +96,6 @@ if gdb.selected_inferior().pid != int(os.environ["ELIO_CI_TEST_PID"]):
     raise gdb.GdbError("could not attach to native test")
 ready = int(os.environ["ELIO_CI_GDB_READY"])
 os.write(ready, b"1")
-os.close(ready)
 resume = "continue"
 while gdb.selected_inferior().pid:
     gdb.execute(resume)
@@ -84,4 +106,6 @@ while gdb.selected_inferior().pid:
     if gdb.selected_inferior().pid and int(gdb.parse_and_eval("$_siginfo.si_signo")) == signal.SIGTRAP:
         record_stacks()
         resume = "signal SIGTRAP"
+os.write(ready, b"X")
+os.close(ready)
 end

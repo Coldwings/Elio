@@ -129,3 +129,7 @@ if (entries) {
 ### Chunking Strategy
 
 Large files are read/written in **1MB chunks** to avoid excessive memory allocation in a single io_uring request. The chunking is transparent to the caller. For `read_file()`, an engaged result contains the bytes actually read; it is not a completeness guarantee — a read failure after bytes were accumulated still returns the partial content. `read_file()` returns `std::nullopt` only when the file cannot be opened or the first read fails before any bytes are produced.
+
+The initial file size is a hint, not a read limit. At that boundary `read_file()`
+checks for another byte before growing its output buffer, so EOF on an unchanged
+file does not trigger a second file-sized allocation.

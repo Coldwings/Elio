@@ -123,72 +123,17 @@ public:
     [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
 
-        enum class push_result {
-            accepted,
-            full,
-            stopped,
-        };
-
-        auto try_push = [&]() -> push_result {
-            std::lock_guard<std::mutex> lock(schedule_mutex_);
-            if (!running_.load(std::memory_order_acquire)) {
-                return push_result::stopped;
-            }
+        // Serialize publication on either queue with request_stop().
+        std::lock_guard<std::mutex> lock(schedule_mutex_);
+        if (!running_.load(std::memory_order_acquire)) return false;
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-            if (detail::force_task_inbox_full_for_test.load(
-                    std::memory_order_acquire)) {
-                return push_result::full;
-            }
+        const bool force_full = detail::force_task_inbox_full_for_test.load(
+            std::memory_order_acquire);
+#else
+        constexpr bool force_full = false;
 #endif
-            if (!inbox_->push(handle.address())) {
-                return push_result::full;
-            }
-            wake_for_submission();
-            return push_result::accepted;
-        };
-
-        switch (try_push()) {
-        case push_result::accepted:
-            return true;
-        case push_result::stopped:
-            return false;
-        case push_result::full:
-            break;
-        }
-
-        // Slow path: inbox full, retry with exponential back-off
-        // Bounded so a stalled / shutting-down worker can't make us spin forever.
-        int backoff = 1;
-        constexpr int max_total_retries = 1024;
-        for (int total = 0; total < max_total_retries; ++total) {
-            for (int i = 0; i < backoff; ++i) {
-                #if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-                #else
-                std::this_thread::yield();
-                #endif
-            }
-            switch (try_push()) {
-            case push_result::accepted:
-                return true;
-            case push_result::stopped:
-                return false;
-            case push_result::full:
-                break;
-            }
-            backoff = std::min(backoff * 2, 1024);
-            std::this_thread::yield();
-        }
-
-        // Preserve progress without making the hot queue dynamically sized.
-        // schedule_mutex_ closes the race with request_stop(); overflow_mutex_
-        // protects the slow-path queue from its single worker consumer.
-        try {
-            std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
-            if (!running_.load(std::memory_order_acquire)) {
-                return false;
-            }
-            {
+        if (force_full || !inbox_->push(handle.address())) {
+            try {
                 std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 if (detail::fail_task_overflow_allocation_for_test.load(
@@ -198,12 +143,12 @@ public:
 #endif
                 overflow_.push_back(handle.address());
                 overflow_size_.fetch_add(1, std::memory_order_release);
+            } catch (...) {
+                // The handle was not published if overflow allocation failed.
+                return false;
             }
-            wake_for_submission();
-        } catch (...) {
-            // The handle was not published if overflow allocation failed.
-            return false;
         }
+        wake_for_submission();
         return true;
     }
 

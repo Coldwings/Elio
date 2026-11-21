@@ -526,6 +526,13 @@ void generic_tls_contexts(tls::tls_context& server, tls::tls_context& client) {
     client.set_verify_mode(tls::verify_mode::none);
 }
 
+void short_io_tls_contexts(tls::tls_context& server, tls::tls_context& client) {
+    generic_tls_contexts(server, client);
+    // These fixtures stop the handshake scheduler before the next client read.
+    // Tiny writes can leave unrelated TLS 1.3 session tickets pending there.
+    REQUIRE(SSL_CTX_set_num_tickets(server.native_handle(), 0) == 1);
+}
+
 struct tls_watchdog_control {
     sync::event entered;
     sync::event release;
@@ -715,7 +722,7 @@ TEST_CASE("TLS stream retries short positive generic lower reads and writes",
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
     tls::tls_context server_context(tls::tls_mode::server);
     tls::tls_context client_context(tls::tls_mode::client);
-    generic_tls_contexts(server_context, client_context);
+    short_io_tls_contexts(server_context, client_context);
     auto server_stats = std::make_shared<fdless_tcp_stream::stats>();
     auto client_stats = std::make_shared<fdless_tcp_stream::stats>();
     tls::basic_tls_stream<fdless_tcp_stream> server(
@@ -743,7 +750,7 @@ TEST_CASE("TLS stream finish_write drains close notify through fd-less lowers",
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
     tls::tls_context server_context(tls::tls_mode::server, tls::tls_version::tls_1_3);
     tls::tls_context client_context(tls::tls_mode::client, tls::tls_version::tls_1_3);
-    generic_tls_contexts(server_context, client_context);
+    short_io_tls_contexts(server_context, client_context);
     auto server_stats = std::make_shared<fdless_tcp_stream::stats>();
     auto client_stats = std::make_shared<fdless_tcp_stream::stats>();
     tls::basic_tls_stream<fdless_tcp_stream> server(

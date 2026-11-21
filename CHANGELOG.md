@@ -26,8 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- External submissions to a full worker inbox now use its overflow queue
+  immediately instead of spinning on the submitting thread (#1322).
+
 - HTTP/2 buffered uploads advance through the owned request body without
   repeatedly moving unsent bytes between DATA frames (#1304).
+- Contending RPC calls now wait for the client's send mutex without polling a
+  timer per waiter. The existing call deadline and cancellation still apply
+  while waiting (#1321).
+
+- `io::read_file()` checks for EOF before growing a full output string, avoiding
+  large temporary allocations on stable files while still reading growth (#1314).
 
 ## [0.6.0] - 2026-10-12
 

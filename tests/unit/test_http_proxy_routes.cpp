@@ -3219,7 +3219,7 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
             capture();
             snapshot.operations = owner->active_operations_for_test();
             if (finite) snapshot.live = owner->admission_counters_for_test().live;
-            snapshot.fd_open = ::fcntl(observed.fd, F_GETFD) >= 0;
+            snapshot.fd_open = snapshot.pause_reached && ::fcntl(observed.fd, F_GETFD) >= 0;
             snapshot.request_ready = call->is_ready();
             shutdown.emplace(scheduler.go_joinable(owner->shutdown()));
             finish_fixture_output(observed.output, call_stop, snapshot.failure);

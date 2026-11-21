@@ -649,7 +649,10 @@ private:
                 co_return rpc_result<Response>(err.code);
             }
 
-            buffer_view view = pending->response_data.view();
+            // Alias the existing request control block: only a decoded
+            // buffer_ref retains it beyond return from call().
+            buffer_view view = detail::retained_message_view(
+                std::shared_ptr<const message_buffer>(pending, &pending->response_data));
             Response response = parse_response<Response>(view);
             co_return rpc_result<Response>(std::move(response));
         } catch (const serialization_error& e) {

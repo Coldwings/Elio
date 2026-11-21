@@ -268,7 +268,13 @@ server.register_method_with_cleanup<GetFileData>(
 received payload. When serializing a response or request, the current
 implementation copies the referenced bytes into the outgoing wire buffer.
 
-**Important**: The referenced data must remain valid until:
+A `buffer_ref` decoded by `rpc_client::call()` retains its received
+message, including when the response or field is copied or moved out of
+`rpc_result`. A raw span or pointer obtained from it does not retain anything:
+keep the field alive while using that view. Direct deserialization from a
+caller-supplied `buffer_view` still borrows the caller's storage.
+
+For externally supplied send buffers, the referenced data must remain valid until:
 - For client: the RPC call completes
 - For server: the cleanup callback is invoked
 

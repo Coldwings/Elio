@@ -830,6 +830,29 @@ TEST_CASE("RPC client ignores pong frames for normal calls", "[rpc][client]") {
     REQUIRE(ok.load(std::memory_order_acquire));
 }
 
+TEST_CASE("RPC call transfers received field ownership to its caller",
+          "[rpc][client][buffer_ref][response-owner]") {
+    // The scripted peer's response is one length-prefixed field containing
+    // "ok"; the owning string and the borrowed blob have the same wire shape.
+    using Method = method_descriptor<306, TestRequest, buffer_ref>;
+    buffer_ref returned;
+    elio::runtime::scheduler sched(1);
+    sched.start();
+    auto call = sched.go_joinable([&]() -> elio::coro::task<void> {
+        auto client = rpc_client<scripted_client_rpc_stream>::create(scripted_client_rpc_stream{});
+        auto result = co_await client->call<Method>(TestRequest{42}, elio::test::scaled_ms(1000));
+        client->close();
+        returned = std::move(result).value();
+    });
+    // Keep admission open for the receive loop and timeout watcher created
+    // by the client. Only start graceful shutdown once the call has finished.
+    REQUIRE(sched.wait_for_idle(elio::test::scaled_ms(5000)));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+    call.await_resume();
+    REQUIRE(returned.retains_message_for_test());
+    CHECK(returned.as_string_view() == "ok");
+}
+
 // ============================================================================
 // rpc_result tests
 // ============================================================================
@@ -1039,6 +1062,29 @@ struct MessageWithBufferRef {
     
     ELIO_RPC_FIELDS(MessageWithBufferRef, id, data, name)
 };
+
+TEST_CASE("decoded RPC response fields retain their backing across result extraction",
+          "[rpc][buffer_ref][response-owner]") {
+    std::weak_ptr<pending_request> observer;
+    buffer_ref extracted;
+    {
+        auto request = std::make_shared<pending_request>();
+        observer = request;
+        buffer_writer wire;
+        serialize(wire, MessageWithBufferRef{42, buffer_ref("abc", 3), "ok"});
+        request->response_data = message_buffer(wire.release());
+        auto view = elio::rpc::detail::retained_message_view(
+            std::shared_ptr<const message_buffer>(request, &request->response_data));
+        auto subview = view.read_bytes(view.remaining());
+        rpc_result<MessageWithBufferRef> result(parse_response<MessageWithBufferRef>(subview));
+        auto response = std::move(result).value();
+        extracted = response.data;
+    }
+    REQUIRE_FALSE(observer.expired());
+    CHECK(extracted.as_string_view() == "abc");
+    extracted = {};
+    CHECK(observer.expired());
+}
 
 TEST_CASE("struct with buffer_ref field", "[rpc][buffer_ref]") {
     std::vector<uint8_t> blob_data = {1, 2, 3, 4, 5, 6, 7, 8};

@@ -435,9 +435,9 @@ Names below use the convenience re-exports from `<elio/http/websocket.hpp>` and
 
 | Interface | Elio guarantees | Caller must guarantee |
 |-----------|-----------------|-----------------------|
-| `rpc::buffer_view` | Represents a non-owning byte view. | Keep backing storage alive and unchanged for the duration of any operation that reads it. |
+| `rpc::buffer_view` | Views constructed by an application from raw bytes do not own them. | Keep caller-supplied backing storage alive and unchanged for the duration of any operation that reads it. |
 | `rpc::buffer_writer` | Appends serialized bytes and reports allocation/size behavior through normal C++ container semantics. | Do not share a mutable writer across threads or coroutines unless externally synchronized. |
-| `rpc::buffer_ref` | Represents a non-owning external byte reference. Deserialization can expose received payload bytes without copying; current serialization copies referenced bytes into the outgoing writer. | Keep referenced storage valid until the operation that reads or copies it has completed. Use cleanup callback registration, not `buffer_ref` itself, for deferred external ownership release. |
+| `rpc::buffer_ref` | A field decoded by `rpc_client::call` retains its received message without copying the payload, even when the field is extracted from the result. Construction from external bytes does not transfer ownership. Serialization copies the referenced bytes into the outgoing writer. | Keep the field alive while using a span or pointer obtained from it. Keep caller-supplied storage valid while it is read or copied; use cleanup callbacks for deferred release of external server data. |
 | `rpc::iovec_buffer` | Builds scatter-gather buffers for frame writes according to the writer contract. | Keep all referenced segments valid until the write operation completes. |
 | RPC CRC32 helpers such as `crc32()`, frame checksum, and iovec checksum functions | Compute non-cryptographic checksums over frames or iovec data. | Use CRC32 only for accidental corruption detection or protocol compatibility, not authentication. |
 | RPC serialization functions and serializers | Serialize/deserialize supported types and `ELIO_RPC_FIELDS` in declared order. | Use compatible schemas on both sides and enforce application-level versioning and validation. |

@@ -407,6 +407,11 @@ server. Context-aware handlers can observe that request-specific cancellation
 through `ctx.cancel_token` and should pass it to cancellable operations or poll
 it before long-running work.
 
+Concurrent calls on a client share a send mutex so their frames cannot
+interleave. If another write holds the mutex, a call queues for a handoff
+without polling. Its deadline and caller cancellation still apply while it
+waits; if cancellation wins the mutex wait, no request frame is sent.
+
 ### Synchronous Handlers
 
 For simple handlers that don't need async operations:

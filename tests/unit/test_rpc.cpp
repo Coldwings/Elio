@@ -4905,6 +4905,96 @@ TEST_CASE("rpc call timeout covers waiting for the request send mutex",
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
+TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is busy",
+          "[rpc][send-contention]") {
+    namespace coro = elio::coro;
+    bool cancel_call = false;
+    SECTION("an earlier call gets the handoff before a later one-way send") {}
+    SECTION("a cancelled call returns before the active writer releases the mutex") {
+        cancel_call = true;
+    }
+    struct send_trace : scripted_client_rpc_stream_state {
+        std::vector<method_id_t> methods;
+        std::promise<void> writing, call_started, oneway_started;
+        std::promise<bool> call_result, oneway_result;
+        coro::cancel_source cancel;
+        elio::sync::event release;
+    };
+    struct gated_stream : scripted_client_rpc_stream {
+        std::shared_ptr<send_trace> trace;
+        explicit gated_stream(std::shared_ptr<send_trace> t)
+            : scripted_client_rpc_stream(t), trace(std::move(t)) {}
+        coro::task<elio::io::io_result> writev(struct iovec* parts, size_t count) {
+            auto header = frame_header::from_bytes(
+                static_cast<const uint8_t*>(parts[0].iov_base));
+            trace->methods.push_back(header.method_id);
+            if (trace->methods.size() == 1) {
+                trace->writing.set_value();
+                co_await trace->release.wait();
+            }
+            if (header.method_id == ExistingStreamCreateMethod::id) {
+                auto [reply, payload] = build_response(header.request_id, TestResponse{"ok"});
+                enqueue_client_frame(*trace, reply, payload);
+            }
+            size_t bytes = 0;
+            for (size_t i = 0; i < count; ++i) bytes += parts[i].iov_len;
+            co_return elio::io::io_result{static_cast<int32_t>(bytes), 0};
+        }
+    };
+
+    auto trace = std::make_shared<send_trace>();
+    auto writing = trace->writing.get_future();
+    auto client = rpc_client<gated_stream>::create(gated_stream{trace});
+    elio::runtime::scheduler sched(1);
+    sched.start();
+    sched.go([client]() -> coro::task<void> {
+        client->start();
+        (void)co_await client->send_oneway<OnewayNoResponseMethod>(TestRequest{1});
+    });
+    const auto limit = elio::test::scaled_sec(5);
+    REQUIRE(writing.wait_for(limit) == std::future_status::ready);
+
+    // Once a sender announces entry, the single worker cannot run its
+    // successor (or the awakened writer) until that sender suspends.
+    auto call_started = trace->call_started.get_future();
+    auto oneway_started = trace->oneway_started.get_future();
+    auto call = trace->call_result.get_future();
+    auto oneway = trace->oneway_result.get_future();
+    sched.go([client, trace, cancel_call]() -> coro::task<void> {
+        trace->call_started.set_value();
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{2}, elio::test::scaled_sec(30), trace->cancel.get_token());
+        if (cancel_call) {
+            trace->release.set();
+            trace->call_result.set_value(!result && result.error() == rpc_error::cancelled);
+        } else {
+            trace->call_result.set_value(result && result.value().result == "ok");
+        }
+    });
+    REQUIRE(call_started.wait_for(limit) == std::future_status::ready);
+    sched.go([client, trace]() -> coro::task<void> {
+        trace->oneway_started.set_value();
+        trace->oneway_result.set_value(
+            co_await client->send_oneway<OnewayNoResponseMethod>(TestRequest{3}));
+    });
+    REQUIRE(oneway_started.wait_for(limit) == std::future_status::ready);
+    if (cancel_call) trace->cancel.cancel();
+    else trace->release.set();
+    auto call_status = call.wait_for(limit);
+    trace->release.set();
+    auto oneway_status = oneway.wait_for(limit);
+    client->close();
+    REQUIRE(sched.shutdown(limit));
+    REQUIRE(call_status == std::future_status::ready);
+    REQUIRE(oneway_status == std::future_status::ready);
+    REQUIRE(call.get());
+    REQUIRE(oneway.get());
+    std::vector<method_id_t> expected{OnewayNoResponseMethod::id};
+    if (!cancel_call) expected.push_back(ExistingStreamCreateMethod::id);
+    expected.push_back(OnewayNoResponseMethod::id);
+    REQUIRE(trace->methods == expected);
+}
+
 TEST_CASE("rpc call failed send closes before queued senders run",
           "[rpc][timeout][cancel]") {
     using namespace elio::runtime;

@@ -441,8 +441,11 @@ public:
             deferred_resumes.clear();
         }
 
+        // Each pending request is counted once: already ready, synchronous,
+        // queued on a timer, or waiting for descriptor readiness. If the
+        // first two account for every request after resuming callers, an
+        // epoll sample cannot deliver any additional completion this turn.
         if (completions > 0 && pending_count() == ready_ops_.size() + pending_sync_ops_) {
-            // No remaining timer or descriptor work to sample.
             return completions;
         }
 
@@ -469,7 +472,7 @@ public:
         
         if (nfds < 0) {
             if (errno == EINTR) {
-                return completions;  // Interrupted, retry
+                return completions;  // Preserve delivered work; the caller can poll again.
             }
             ELIO_LOG_ERROR("epoll_wait failed: {}", strerror(errno));
             return -1;

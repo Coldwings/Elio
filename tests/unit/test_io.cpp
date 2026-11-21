@@ -2452,6 +2452,7 @@ TEST_CASE("epoll services ready descriptors and expired timers alongside immedia
     epoll_backend backend;
     io_request timer{};
     timer.op = io_op::timeout;
+    timer.length = 0;  // Relative nanoseconds: expire in this poll.
     REQUIRE(backend.prepare(timer));
     io_request socket_ready{};
     socket_ready.op = io_op::poll_read;

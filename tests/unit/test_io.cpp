@@ -4281,6 +4281,8 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     int connecting = num_clients;
     SECTION("three clients connect concurrently") {}
     SECTION("cancel the accept loop when only one client arrives") { connecting = 1; }
+    // Cancellation waits for the accept following the last arriving client.
+    const int expected_accept_attempts = connecting == num_clients ? connecting : connecting + 1;
 
     auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
     auto listener = uds_listener::bind(addr);
@@ -4304,6 +4306,7 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     };
     auto connect_one = [&](int index) -> task<void> {
         client_streams[index] = co_await uds_connect(addr, token);
+        if (!client_streams[index]) co_return;
         ++connects_done;
     };
 
@@ -4314,7 +4317,7 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
 
     const bool reached = wait_for_uds_stream_test([&] {
         return connects_done == connecting && accepts_done == connecting &&
-               (connecting == num_clients || accept_attempts == connecting + 1);
+               accept_attempts == expected_accept_attempts;
     }, elio::test::scaled_ms(5000));
     // Cancel any outstanding accept/connect before either shutdown or failure unwinds.
     if (!reached || connecting < num_clients) stop.cancel();
@@ -4322,7 +4325,7 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     REQUIRE(reached);
     REQUIRE(accepts_done == connecting);
     REQUIRE(connects_done == connecting);
-    REQUIRE(accept_attempts == (connecting == num_clients ? num_clients : connecting + 1));
+    REQUIRE(accept_attempts == expected_accept_attempts);
 
     for (int i = 0; i < connecting; ++i) {
         REQUIRE(server_streams[i].has_value());

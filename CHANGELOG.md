@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
 
+### Fixed
+
+- `io::read_dir()` reports enumeration errors rather than returning a partial
+  directory listing as success (#1306).
+
 ## [0.6.0] - 2026-10-12
 
 This is the first formal 0.6 release. It includes intentional API and

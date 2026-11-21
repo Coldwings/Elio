@@ -1,8 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/elio.hpp>
+#include <array>
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 using namespace elio;
 using namespace elio::runtime;
@@ -65,6 +69,39 @@ struct idle_capture_action {
     void operator()(trigger_test_scheduler*, size_t,
                     std::chrono::seconds) const noexcept {
         calls.fetch_add(1, std::memory_order_release);
+    }
+};
+
+struct scripted_resize_scheduler {
+    struct sample { size_t pending, workers; };
+    // Each group visits the bound, then throws once, then returns normally
+    // without changing the reported count (a valid scheduler no-op).
+    static constexpr std::array<sample, 6> samples{{
+        {2, 3}, {2, 2}, {2, 2}, {0, 2}, {0, 3}, {0, 3}
+    }};
+    size_t ticks = 0;
+    std::atomic<bool> finished{false};
+    std::vector<std::pair<size_t, size_t>> attempts;
+    std::vector<std::pair<size_t, char>> handlers;
+
+    size_t pending_tasks() {
+        if (ticks < samples.size()) return samples[ticks++].pending;
+        finished.store(true, std::memory_order_release);
+        return 1;  // Neutral load until the test stops the monitor.
+    }
+    size_t num_threads() const { return samples[ticks - 1].workers; }
+    void set_thread_count(size_t target) {
+        attempts.emplace_back(ticks, target);
+        if (ticks == 2) throw std::runtime_error("growth failed");
+        if (ticks == 5) throw 5;  // Custom schedulers need not throw std::exception.
+    }
+};
+
+template<char Marker>
+struct record_resize_handler {
+    template<typename... Args>
+    void operator()(scripted_resize_scheduler* sched, Args...) const {
+        sched->handlers.emplace_back(sched->ticks, Marker);
     }
 };
 
@@ -139,6 +176,75 @@ TEST_CASE("autoscaler start/stop", "[autoscaler]") {
 
     scaler.stop();
     sched.shutdown();
+}
+
+TEST_CASE("autoscaler dispatches handlers inside scale actions",
+          "[autoscaler][scale-handlers]") {
+    overload_capture_action::calls.store(0);
+    idle_capture_action::calls.store(0);
+    autoscaler_config config;
+    config.tick_interval = std::chrono::milliseconds(1);
+    config.overload_threshold = 1;
+    config.idle_threshold = 1;
+    config.idle_delay = std::chrono::seconds(0);
+    config.min_workers = 2;
+    config.max_workers = 3;
+    trigger_test_scheduler sched;
+    autoscaler<trigger_test_scheduler,
+               on_overload<scale_up<on_success<overload_capture_action>>>,
+               on_idle<scale_down<on_success<idle_capture_action>>>> scaler(config);
+    scaler.start(&sched);
+    const bool grew = wait_for_condition([&] { return sched.num_threads() == 3; },
+                                         std::chrono::seconds(2));
+    sched.pending.store(0);
+    const bool shrank = wait_for_condition([&] { return sched.num_threads() == 2; },
+                                            std::chrono::seconds(2));
+    scaler.stop();
+    REQUIRE(grew);
+    REQUIRE(shrank);
+    CHECK(overload_capture_action::calls.load() == 1);
+    CHECK(idle_capture_action::calls.load() == 1);
+}
+
+TEST_CASE("autoscaler reports resize outcomes without retrying within a tick",
+          "[autoscaler][scale-handlers]") {
+    autoscaler_config config;
+    config.tick_interval = std::chrono::milliseconds(1);
+    config.overload_threshold = config.idle_threshold = 1;
+    config.idle_delay = std::chrono::seconds(0);
+    config.min_workers = 2;
+    config.max_workers = 3;
+    scripted_resize_scheduler sched;
+    auto run = [&](auto& scaler) {
+        scaler.start(&sched);
+        const bool finished = wait_for_condition([&] {
+            return sched.finished.load(std::memory_order_acquire);
+        }, std::chrono::seconds(2));
+        scaler.stop();
+        REQUIRE(finished);
+    };
+    SECTION("default monitor survives resize failures and samples again") {
+        autoscaler<scripted_resize_scheduler> scaler(config);
+        run(scaler);
+        CHECK(sched.handlers.empty());
+    }
+    SECTION("scale wrappers select the outcome; unguarded actions still run in order") {
+        using success = on_success<record_resize_handler<'S'>>;
+        using failure = on_failure<record_resize_handler<'F'>>;
+        using always = record_resize_handler<'A'>;
+        using next = record_resize_handler<'N'>;
+        autoscaler<scripted_resize_scheduler,
+                   on_overload<scale_up<success, failure, always>, next>,
+                   on_idle<scale_down<success, failure, always>, next>> scaler(config);
+        run(scaler);
+        CHECK(sched.handlers == std::vector<std::pair<size_t, char>>{
+            {2, 'F'}, {2, 'A'}, {2, 'N'}, {3, 'S'}, {3, 'A'}, {3, 'N'},
+            {5, 'F'}, {5, 'A'}, {5, 'N'}, {6, 'S'}, {6, 'A'}, {6, 'N'}
+        });
+    }
+    CHECK(sched.attempts == std::vector<std::pair<size_t, size_t>>{
+        {2, 3}, {3, 3}, {5, 2}, {6, 2}
+    });
 }
 
 TEST_CASE("autoscaler custom trigger pack", "[autoscaler]") {

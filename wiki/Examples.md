@@ -982,6 +982,20 @@ The autoscaler supports:
 - **Actions**: `scale_up`, `scale_down`, `log`, `null`
 - **Combinators**: `on_success`, `on_failure`
 
+For example, `on_overload<scale_up<on_success<log>>>` logs once after the
+overload trigger calls `set_thread_count` and it returns normally, even if
+the scheduler ignored the request (for example, during shutdown). If
+`set_thread_count` throws, `on_failure` runs instead. Handlers inside the
+matching scale wrapper run in declaration order; the wrapper does not
+request a second resize. At the worker limit the trigger does not attempt
+a resize or dispatch any handlers. A normal return does not prove the worker
+count changed.
+
+With or without custom handlers, the monitor logs a resize exception at
+warning level and continues on its normal tick interval, sampling conditions
+again before another attempt. Handlers run on the monitor thread and must
+not let exceptions escape; handler exceptions are not resize failures.
+
 The complete `autoscaler_example` retains join handles for every submitted load
 phase and waits for all task frames to be destroyed before releasing captured
 phase state or beginning its low-load observation. Use

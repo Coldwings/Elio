@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
 
+### Fixed
+
+- Autoscaler scale wrappers now dispatch nested handlers once per resize
+  request. A thrown resize reports failure and leaves the monitor running;
+  reaching a worker limit does not invoke any handlers (#1318).
+
 ## [0.6.0] - 2026-10-12
 
 This is the first formal 0.6 release. It includes intentional API and

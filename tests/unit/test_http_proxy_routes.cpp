@@ -2876,11 +2876,13 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
     }
     bool reached = false;
     auto result = elio::coro::cancel_result::cancelled;
+    // Nested waits finish inside this frame and share its observer state.
+    auto observe = [&before_recovery]() noexcept { before_recovery(); };
     try {
         reached = co_await await_fixture_ready(*waiting, output, stop, failure,
-            std::chrono::seconds(10), before_recovery);
+            std::chrono::seconds(10), observe);
         result = co_await await_fixture_result(*waiting, output, stop, failure,
-            before_recovery);
+            observe);
     } catch (...) {
         if (!failure) failure = std::current_exception();
         before_recovery();
@@ -3516,9 +3518,10 @@ TEST_CASE("Direct TLS fixture can cancel an accepted peer before its handshake",
     const bool finished_without_opening_gate = destroyed_future.wait_for(limit) == std::future_status::ready;
     permit.set();  // Allow cleanup even if the cancellation assertion would fail.
     ::shutdown(peer.fd, SHUT_RDWR);
-    observer.wait_destroyed();
-    server.wait_destroyed();
-    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    CAPTURE(accepted, finished_without_opening_gate);
+    REQUIRE(scheduler.shutdown(limit));
+    REQUIRE(observer.is_destroyed());
+    REQUIRE(server.is_destroyed());
     observer.await_resume();
     server.await_resume();
     CHECK(accepted);

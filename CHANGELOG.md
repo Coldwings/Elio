@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
 
+### Changed
+
+- HTTP/2 buffered uploads advance through the owned request body without
+  repeatedly moving unsent bytes between DATA frames (#1304).
+
 ### Fixed
 
 - Client response `rpc::buffer_ref` fields now retain their received message

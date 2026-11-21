@@ -15,11 +15,10 @@
 ///
 /// The dispatcher is intentionally **thread-agnostic**: `deliver()` can
 /// be invoked from any thread, including a custom busy-poll thread
-/// running outside any Elio scheduler. Coroutine resumption is routed
-/// through `runtime::schedule_handle`, which already handles the
-/// no-current-scheduler case by resuming synchronously on the caller's
-/// thread (matches the semantics already used by sync primitives and
-/// cancel_token paths).
+/// running outside any Elio scheduler. For a suspended Elio task,
+/// `runtime::schedule_handle` routes to the task's leased worker first.
+/// Without an active lease it uses the notifier's current scheduler, or
+/// the inline trampoline if the notifier has no current scheduler.
 
 #include <elio/rdma/op_state.hpp>
 #include <elio/rdma/types.hpp>
@@ -133,8 +132,7 @@ public:
                     continue;
                 }
 
-                // We own the race. Hand the coroutine off to the scheduler
-                // (or resume inline if no scheduler is current). We do NOT
+                // We own the race. Route the waiter via schedule_handle. We do NOT
                 // free `op` here — the awaiter still holds a
                 // `unique_ptr<op_state>` and is responsible for the free
                 // after it has consumed `op->result` via await_resume.

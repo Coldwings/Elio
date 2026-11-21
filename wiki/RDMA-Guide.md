@@ -331,9 +331,11 @@ pump.
 
 For busy-poll, DPDK-style, or shared-CQ setups, call
 `dispatcher.deliver(wr_id, status, byte_len, imm_data, wc_flags)`
-from any thread. It's safe to call from outside Elio's scheduler;
-the waiter is handed to `runtime::schedule_handle` for routing. When no
-scheduler is current, routing resumes it inline.
+from any thread, including one outside Elio. If the completion wakes a
+suspended Elio task with an active worker lease, the task is routed to its
+leased worker, even when the poller belongs to a different scheduler. Without
+a lease, routing uses the poller's current scheduler if it has one; otherwise
+it uses the inline trampoline on the polling thread. See [[Worker Leases]].
 
 ## op_state lifecycle
 

@@ -3189,8 +3189,9 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
     elio::runtime::scheduler scheduler(workers);
     scheduler.start();
     auto server = scheduler.go_joinable(
-        serve_direct_output(*listener, server_context, observed, stop.get_token()));
+        serve_direct_output(*listener, server_context, observed, stop.get_token(), &observed.output.paused));
     struct failure_snapshot {
+        direct_phase_diagnostics phases;
         size_t operations = 0;
         size_t live = 0;
         bool fd_open = false;
@@ -3206,12 +3207,16 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
         std::optional<elio::coro::join_handle<client_result<response>>> call;
         std::optional<elio::coro::join_handle<elio::coro::cancel_result>> shutdown;
         client_result<response> result;
+        auto capture = [&]() noexcept {
+            if (!snapshot.phases.captured) capture_direct_phases(snapshot.phases);
+        };
         try {
             call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
             snapshot.pause_reached = co_await await_fixture_phase(
-                observed.output.paused, observed.output, call_stop, snapshot.failure);
+                observed.output.paused, observed.output, call_stop, snapshot.failure, capture);
             snapshot.failure_observed = co_await await_fixture_phase(
-                observed.handshake_failed, observed.output, call_stop, snapshot.failure);
+                observed.handshake_failed, observed.output, call_stop, snapshot.failure, capture);
+            capture();
             snapshot.operations = owner->active_operations_for_test();
             if (finite) snapshot.live = owner->admission_counters_for_test().live;
             snapshot.fd_open = ::fcntl(observed.fd, F_GETFD) >= 0;
@@ -3222,6 +3227,7 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
             snapshot.shutdown_result = co_await await_fixture_result(
                 *shutdown, observed.output, call_stop, snapshot.failure);
         } catch (...) {
+            capture();
             if (!snapshot.failure) snapshot.failure = std::current_exception();
             finish_fixture_output(observed.output, call_stop, snapshot.failure, true);
         }
@@ -3236,6 +3242,8 @@ TEST_CASE("Failed direct TLS setup retains accounting until its late output root
     REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
     const auto result = controlled.await_resume();
     server.await_resume();
+    CAPTURE(snapshot.phases.captured, snapshot.phases.client_tls_created, snapshot.phases.client_tls_failed,
+            snapshot.phases.server_accepted, snapshot.phases.server_handshake_entered);
     if (snapshot.failure) std::rethrow_exception(snapshot.failure);
     CHECK(snapshot.pause_reached);
     CHECK(snapshot.failure_observed);

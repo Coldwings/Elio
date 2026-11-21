@@ -760,6 +760,10 @@ private:
             
             ELIO_LOG_DEBUG("SSE reconnecting (attempt {}) in {}ms...", attempts, retry_ms);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+            // A previous reconnect may already have staged its own header read.
+            if (http::detail::observe_client_response_read_entry_for_test.load()) {
+                http::detail::client_response_read_staged_for_test.store(false);
+            }
             http::detail::sse_reconnect_wait_ms_for_test.store(retry_ms);
 #endif
             

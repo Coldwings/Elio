@@ -5,9 +5,11 @@
 #include "autoscaler_actions.hpp"
 #include <thread>
 #include <atomic>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <type_traits>
 #include <vector>
 
 namespace elio::runtime {
@@ -190,11 +192,27 @@ private:
         return pending * 2 < cfg.idle_threshold;
     }
 
+    // A normal return is the result of the request, not a guarantee that a
+    // concurrently observed worker count equals the target. Callbacks run
+    // outside this boundary so their exceptions are not treated as resize failures.
+    bool try_resize(size_t target) {
+        try {
+            scheduler_->set_thread_count(target);
+        } catch (const std::exception& e) {
+            ELIO_LOG_WARNING("Autoscaler: set_thread_count({}) failed: {}", target, e.what());
+            return false;
+        } catch (...) {
+            ELIO_LOG_WARNING("Autoscaler: set_thread_count({}) failed: unknown exception", target);
+            return false;
+        }
+        return true;
+    }
+
     // Default overload handler - scale up when overloaded (proportional).
     void handle_default_overload(size_t pending, size_t num_workers, const autoscaler_config& cfg) {
         const size_t step = compute_scale_up_step(pending, num_workers, cfg);
         if (step > 0) {
-            scheduler_->set_thread_count(num_workers + step);
+            try_resize(num_workers + step);
         }
     }
 
@@ -204,7 +222,7 @@ private:
         if (below_idle_with_hysteresis(pending, cfg) && num_workers > cfg.min_workers) {
             auto idle_duration = now - last_idle_time;
             if (idle_duration > cfg.idle_delay) {
-                scheduler_->set_thread_count(num_workers - 1);
+                try_resize(num_workers - 1);
             }
         }
     }
@@ -221,12 +239,7 @@ private:
             size_t current = scheduler_->num_threads();
             const size_t step = compute_scale_up_step(pending, current, cfg);
             if (step > 0) {
-                scheduler_->set_thread_count(current + step);
-                // Success detection via re-reading num_threads() is inherently
-                // racy (another entity could change thread count between set and
-                // read). Treat step > 0 as 'attempted' since the step computation
-                // already validates headroom against max_workers.
-                bool success = true;
+                const bool success = try_resize(current + step);
                 if constexpr (sizeof...(Actions) > 0) {
                     execute_overload_actions<Actions...>(success, pending);
                 }
@@ -245,10 +258,7 @@ private:
             if (idle_duration > cfg.idle_delay) {
                 size_t current = scheduler_->num_threads();
                 if (current > cfg.min_workers) {
-                    scheduler_->set_thread_count(current - 1);
-                    // Same rationale as on_overload: treat the attempt as success
-                    // since we validated headroom before calling set_thread_count.
-                    bool success = true;
+                    const bool success = try_resize(current - 1);
                     if constexpr (sizeof...(Actions) > 0) {
                         auto idle_secs = std::chrono::duration_cast<std::chrono::seconds>(idle_duration);
                         execute_idle_actions<Actions...>(success, pending, idle_secs);
@@ -309,12 +319,27 @@ private:
         }
     }
 
+    // A scale wrapper groups callbacks for the resize already performed by
+    // its trigger. Dispatch the children without issuing another resize.
+    template<typename... Handlers>
+    void dispatch_scale_handlers(std::type_identity<scale_up<Handlers...>>, bool success, size_t pending) {
+        (execute_single_action<Handlers>(success, pending), ...);
+    }
+
+    template<typename... Handlers>
+    void dispatch_scale_handlers(std::type_identity<scale_down<Handlers...>>, bool success, size_t pending,
+                                 std::chrono::seconds idle_time) {
+        (execute_single_action<Handlers>(success, pending, idle_time), ...);
+    }
+
     // Single action execution - overload
     template<typename Action>
     void execute_single_action(bool success, size_t pending) {
         using T = std::decay_t<Action>;
 
-        if constexpr (std::is_same_v<T, log>) {
+        if constexpr (requires { dispatch_scale_handlers(std::type_identity<T>{}, success, pending); }) {
+            dispatch_scale_handlers(std::type_identity<T>{}, success, pending);
+        } else if constexpr (std::is_same_v<T, log>) {
             Action{}(scheduler_, pending);
         } else if constexpr (std::is_same_v<T, null>) {
             // no-op
@@ -338,7 +363,9 @@ private:
     void execute_single_action(bool success, size_t pending, std::chrono::seconds idle_time) {
         using T = std::decay_t<Action>;
 
-        if constexpr (std::is_same_v<T, log>) {
+        if constexpr (requires { dispatch_scale_handlers(std::type_identity<T>{}, success, pending, idle_time); }) {
+            dispatch_scale_handlers(std::type_identity<T>{}, success, pending, idle_time);
+        } else if constexpr (std::is_same_v<T, log>) {
             Action{}(scheduler_, pending, idle_time);
         } else if constexpr (std::is_same_v<T, null>) {
             // no-op

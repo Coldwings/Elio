@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Graceful shutdown no longer stops an I/O owner early when a concurrent grow
   is waiting to reuse its retiring worker slot (#1312).
+- Autoscaler scale wrappers now dispatch nested handlers once per resize
+  request. A thrown resize reports failure and leaves the monitor running;
+  reaching a worker limit does not invoke any handlers (#1318).
 - `io::read_dir()` reports enumeration errors rather than returning a partial
   directory listing as success (#1306).
 

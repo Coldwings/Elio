@@ -1956,8 +1956,8 @@ inline void worker_thread::drain_inbox() noexcept {
         queue_->push(item);
     }
 
-    // Overflow is used only after bounded inbox retries. Swap under the lock
-    // so producers are never held while the worker updates its local deque.
+    // Swap the overflow batch under the lock so producers are never held
+    // while the worker updates its local deque.
     std::deque<void*> overflow;
     {
         std::lock_guard<std::mutex> lock(overflow_mutex_);

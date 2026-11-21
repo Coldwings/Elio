@@ -4925,6 +4925,10 @@ TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is
         explicit gated_stream(std::shared_ptr<send_trace> t)
             : scripted_client_rpc_stream(t), trace(std::move(t)) {}
         coro::task<elio::io::io_result> writev(struct iovec* parts, size_t count) {
+            if (!parts || count == 0 || !parts[0].iov_base ||
+                parts[0].iov_len < frame_header_size) {
+                co_return elio::io::io_result{-EINVAL, 0};
+            }
             auto header = frame_header::from_bytes(
                 static_cast<const uint8_t*>(parts[0].iov_base));
             trace->methods.push_back(header.method_id);
@@ -4965,7 +4969,6 @@ TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is
         auto result = co_await client->call<ExistingStreamCreateMethod>(
             TestRequest{2}, elio::test::scaled_sec(30), trace->cancel.get_token());
         if (cancel_call) {
-            trace->release.set();
             trace->call_result.set_value(!result && result.error() == rpc_error::cancelled);
         } else {
             trace->call_result.set_value(result && result.value().result == "ok");
@@ -4981,7 +4984,7 @@ TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is
     if (cancel_call) trace->cancel.cancel();
     else trace->release.set();
     auto call_status = call.wait_for(limit);
-    trace->release.set();
+    if (cancel_call) trace->release.set();
     auto oneway_status = oneway.wait_for(limit);
     client->close();
     REQUIRE(sched.shutdown(limit));

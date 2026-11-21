@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is waiting to reuse its retiring worker slot (#1312).
 
 - SSE clients honor `default_retry_ms` when reconnecting without a
-  server-advertised retry interval (#1308).
+  server-advertised retry interval. A nonpositive default reconnects immediately
+  on the first attempt and backs off after failures (#1308).
 
 ### Added
 

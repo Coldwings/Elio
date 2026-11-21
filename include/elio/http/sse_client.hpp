@@ -783,10 +783,9 @@ private:
             
             state_ = client_state::reconnecting;
             
-            // Increase retry interval (exponential backoff, max 1 minute)
-            // Cap before multiplying to prevent signed integer overflow (UB).
-            current_retry_ms_ = std::min(current_retry_ms_, 30000) * 2;
-            current_retry_ms_ = std::min(current_retry_ms_, 60000);
+            // An immediate first attempt still backs off if it fails.
+            // Cap before doubling so large advertised intervals cannot overflow.
+            current_retry_ms_ = std::max(1, std::min(retry_ms, 30000) * 2);
             retry_ms = current_retry_ms_;
         }
         

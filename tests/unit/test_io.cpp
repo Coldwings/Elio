@@ -2444,7 +2444,8 @@ TEST_CASE("epoll stream destructor fails a parked read with -ECANCELED and "
 TEST_CASE("epoll services ready descriptors and expired timers alongside immediate completions",
           "[io][epoll][fair-service]") {
     // Keep owners alive until after the backend drops all of its registrations.
-    std::unique_ptr<FILE, decltype(&std::fclose)> file(std::tmpfile(), &std::fclose);
+    auto close_file = [](FILE* stream) noexcept { std::fclose(stream); };
+    std::unique_ptr<FILE, decltype(close_file)> file(std::tmpfile(), close_file);
     REQUIRE(file != nullptr);
     elio::io::fd_guard event_fd(::eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC));
     REQUIRE(event_fd.get() >= 0);

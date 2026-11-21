@@ -338,17 +338,20 @@ scheduler is current, routing resumes it inline.
 ## op_state lifecycle
 
 The awaiter and the dispatcher race for ownership of a per-WR
-`op_state` heap node:
+`op_state` heap node. The CQE's `wr_id` identifies that node:
 
-* The awaiter holds the node via `unique_ptr`.
-* On `co_await` it posts the WR with `wr_id =
-  dispatcher::make_wr_id(op_state*)`.
-* When the CQE arrives, `dispatcher.deliver(wr_id, ...)` CASes
-  `pending → completed`, fills the result, and hands the waiter snapshot to
-  scheduler routing.
-* If an owner explicitly destroys the awaiter before the CQE arrives, the
-  destructor CASes `pending → orphaned`; the dispatcher's later CQE arrival
-  sees `orphaned` and silently frees the node.
+* The awaiter owns the node. Construction does not post a work request:
+  `co_await` posts a lazy operation, or `.start()` posts it explicitly.
+  Awaiting a started operation never posts it a second time.
+* To complete a live operation, the dispatcher stores the CQE result before
+  publishing `completed`. If it completes the operation during posting or
+  before a started operation has a waiter, no coroutine needs scheduling;
+  the awaiter returns the stored result.
+  If a waiter is already suspended, the dispatcher saves its handle before
+  publishing `pending → completed`, then routes that handle.
+* If the awaiter is destroyed while the operation is still `posted` or
+  `pending` and wins the transition to `orphaned`, the dispatcher frees the
+  node when the CQE arrives. This does not cancel the work request.
 
 Exactly one party frees the heap node; the coroutine is resumed at
 most once. This is the same UAF-safe pattern PR #69 introduced for

@@ -435,7 +435,7 @@ Names below use the convenience re-exports from `<elio/http/websocket.hpp>` and
 
 | Interface | Elio guarantees | Caller must guarantee |
 |-----------|-----------------|-----------------------|
-| `rpc::buffer_view` | Views constructed by an application from raw bytes do not own them. | Keep caller-supplied backing storage alive and unchanged for the duration of any operation that reads it. |
+| `rpc::buffer_view` | Views constructed from caller-supplied bytes borrow them. A view backed by a retained RPC receive message keeps that message alive; its subviews retain the same owner. | Keep borrowed storage alive and unchanged while it is read. A raw pointer or span does not extend the lifetime of a retained message. |
 | `rpc::buffer_writer` | Appends serialized bytes and reports allocation/size behavior through normal C++ container semantics. | Do not share a mutable writer across threads or coroutines unless externally synchronized. |
 | `rpc::buffer_ref` | A field decoded by `rpc_client::call` retains its received message without copying the payload, even when the field is extracted from the result. Construction from external bytes does not transfer ownership. Serialization copies the referenced bytes into the outgoing writer. | Keep the field alive while using a span or pointer obtained from it. Keep caller-supplied storage valid while it is read or copied; use cleanup callbacks for deferred release of external server data. |
 | `rpc::iovec_buffer` | Builds scatter-gather buffers for frame writes according to the writer contract. | Keep all referenced segments valid until the write operation completes. |

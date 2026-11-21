@@ -992,8 +992,8 @@ a resize or dispatch any handlers. A normal return does not prove the worker
 count changed.
 
 With or without custom handlers, the monitor logs a resize exception at
-warning level and continues on its normal tick interval, sampling conditions
-again before another attempt. Handlers run on the monitor thread and must
+warning level. The trigger that made the request does not retry it. Other
+configured triggers can still act on the same sample. Handlers run on the monitor thread and must
 not let exceptions escape; handler exceptions are not resize failures.
 
 The complete `autoscaler_example` retains join handles for every submitted load

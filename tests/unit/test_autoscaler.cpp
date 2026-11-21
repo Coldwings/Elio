@@ -206,7 +206,7 @@ TEST_CASE("autoscaler dispatches handlers inside scale actions",
     CHECK(idle_capture_action::calls.load() == 1);
 }
 
-TEST_CASE("autoscaler reports resize outcomes without retrying within a tick",
+TEST_CASE("autoscaler reports resize outcomes without retrying a trigger's request",
           "[autoscaler][scale-handlers]") {
     autoscaler_config config;
     config.tick_interval = std::chrono::milliseconds(1);

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Graceful shutdown no longer stops an I/O owner early when a concurrent grow
+  is waiting to reuse its retiring worker slot (#1312).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease

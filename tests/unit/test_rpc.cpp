@@ -1086,6 +1086,63 @@ TEST_CASE("decoded RPC response fields retain their backing across result extrac
     CHECK(observer.expired());
 }
 
+TEST_CASE("moving received RPC views transfers their backing and cursor",
+          "[rpc][buffer_ref][response-owner][view-move]") {
+    buffer_writer wire;
+    serialize(wire, buffer_ref("abc", 3));
+    auto message = std::make_shared<message_buffer>(wire.release());
+    std::weak_ptr<const message_buffer> observer = message;
+    auto reader = elio::rpc::detail::retained_message_view(std::move(message));
+    SECTION("reader moves retain the cursor on the destination only") {
+        reader.skip(1);
+        buffer_view first(std::move(reader));
+        REQUIRE(observer.use_count() == 1);
+        CHECK(reader.empty());
+        CHECK(reader.remaining() == 0);
+        buffer_view second;
+        second = std::move(first);
+        REQUIRE(observer.use_count() == 1);
+        CHECK(first.empty());
+        CHECK(first.position() == 0);
+        CHECK(second.position() == 1);
+        second = {};
+        CHECK(observer.expired());
+    }
+    SECTION("field moves transfer the last owner") {
+        buffer_ref field;
+        deserialize(reader, field);
+        reader = {};
+        buffer_ref first(std::move(field));
+        REQUIRE(observer.use_count() == 1);
+        CHECK(field.empty());
+        buffer_ref second;
+        second = std::move(first);
+        REQUIRE(observer.use_count() == 1);
+        CHECK(first.empty());
+        CHECK(second.size() == 3);
+        second = {};
+        CHECK(observer.expired());
+    }
+}
+
+TEST_CASE("borrowed RPC views keep their original move behavior",
+          "[rpc][buffer_ref][view-move]") {
+    const uint8_t data[] = {1, 2, 3};
+    buffer_ref borrowed_field(data, sizeof(data));
+    buffer_ref field(std::move(borrowed_field));
+    CHECK(field.data() == data);
+    CHECK(borrowed_field.size() == sizeof(data));
+    buffer_view borrowed_view(data, sizeof(data));
+    borrowed_view.skip(1);
+    buffer_view reader;
+    reader = std::move(borrowed_view);
+    CHECK(reader.data() == data);
+    CHECK(reader.position() == 1);
+    CHECK(borrowed_view.position() == 1);
+    CHECK(borrowed_view.remaining() == 2);
+    CHECK(elio::rpc::detail::retained_message_view({}).empty());
+}
+
 TEST_CASE("struct with buffer_ref field", "[rpc][buffer_ref]") {
     std::vector<uint8_t> blob_data = {1, 2, 3, 4, 5, 6, 7, 8};
     

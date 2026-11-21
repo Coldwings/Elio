@@ -311,8 +311,7 @@ inline void serialize_impl(buffer_writer& writer, const buffer_ref& ref) {
 /// Deserialize buffer_ref (returns view into received buffer - zero copy)
 inline void deserialize_impl(buffer_view& reader, buffer_ref& ref) {
     auto span = reader.read_blob();
-    ref = buffer_ref(span);
-    ref.owner_ = reader.owner_;
+    ref = buffer_ref(span, reader.owner_);
 }
 
 /// Serialize vector

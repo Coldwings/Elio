@@ -82,6 +82,20 @@ public:
     buffer_ref() noexcept = default;
     buffer_ref(const buffer_ref&) noexcept = default;
     buffer_ref& operator=(const buffer_ref&) noexcept = default;
+    buffer_ref(buffer_ref&& other) noexcept { *this = std::move(other); }
+    buffer_ref& operator=(buffer_ref&& other) noexcept {
+        if (this != &other) {
+            data_ = other.data_;
+            size_ = other.size_;
+            owner_ = std::move(other.owner_);
+            if (owner_) {
+                // A received field cannot remain a borrowed alias after transfer.
+                other.data_ = nullptr;
+                other.size_ = 0;
+            }
+        }
+        return *this;
+    }
     
     /// Construct from raw pointer and size
     buffer_ref(const void* data, size_t size) noexcept
@@ -125,6 +139,8 @@ public:
     
 private:
     friend void deserialize_impl(buffer_view&, buffer_ref&);
+    buffer_ref(std::span<const uint8_t> bytes, std::shared_ptr<const message_buffer> owner) noexcept
+        : owner_(std::move(owner)), data_(bytes.data()), size_(bytes.size()) {}
     std::shared_ptr<const message_buffer> owner_;
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
@@ -147,6 +163,21 @@ public:
     buffer_view() noexcept = default;
     buffer_view(const buffer_view&) noexcept = default;
     buffer_view& operator=(const buffer_view&) noexcept = default;
+    buffer_view(buffer_view&& other) noexcept { *this = std::move(other); }
+    buffer_view& operator=(buffer_view&& other) noexcept {
+        if (this != &other) {
+            data_ = other.data_;
+            size_ = other.size_;
+            pos_ = other.pos_;
+            owner_ = std::move(other.owner_);
+            if (owner_) {
+                other.data_ = nullptr;
+                other.size_ = 0;
+                other.pos_ = 0;
+            }
+        }
+        return *this;
+    }
     
     buffer_view(const void* data, size_t size) noexcept
         : data_(static_cast<const uint8_t*>(data))
@@ -557,6 +588,7 @@ private:
 
 namespace detail {
 inline buffer_view retained_message_view(std::shared_ptr<const message_buffer> owner) noexcept {
+    if (!owner) return {};
     auto view = owner->view();
     view.owner_ = std::move(owner);
     return view;

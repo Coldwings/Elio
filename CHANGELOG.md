@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Graceful shutdown no longer stops an I/O owner early when a concurrent grow
+  is waiting to reuse its retiring worker slot (#1312).
+
+- SSE clients honor `default_retry_ms` when reconnecting without a
+  server-advertised retry interval (#1308).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease
@@ -20,11 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - HTTP/2 buffered uploads advance through the owned request body without
   repeatedly moving unsent bytes between DATA frames (#1304).
-
-### Fixed
-
-- SSE clients honor `default_retry_ms` when reconnecting without a
-  server-advertised retry interval (#1308).
 
 ## [0.6.0] - 2026-10-12
 

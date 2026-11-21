@@ -3,6 +3,7 @@
 #include <elio/runtime/async_main.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/task_group.hpp>
+#include <elio/io/file_helpers.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 
@@ -11,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <sys/eventfd.h>
 
 #include "../test_main.cpp"  // For scaled_ms / scaled_sec
 
@@ -818,6 +820,64 @@ TEST_CASE("draining worker shutdown is handed to an active resize",
     REQUIRE(!sched.is_running());
 }
 
+TEST_CASE("graceful shutdown interrupts regrowth without stopping the I/O owner",
+          "[scheduler][shutdown][resize][lifecycle][regression]") {
+    scheduler_test_hook_guard hooks;
+    auto& grow_waiting = elio::runtime::detail::resize_waiting_for_draining_worker_for_test;
+    auto& admission_closed = elio::runtime::detail::graceful_admission_closed_for_test;
+    grow_waiting.store(false, std::memory_order_release);
+    admission_closed.store(false, std::memory_order_release);
+
+    elio::io::fd_guard fd(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+    REQUIRE(fd.get() >= 0);
+    std::atomic<bool> read_on_owner{false};
+    size_t owner_index = 1;
+    SECTION("first regrowth slot is still draining") {}
+    SECTION("one earlier slot has already been reactivated") { owner_index = 2; }
+    scheduler sched(owner_index + 1);
+    auto* worker = sched.get_worker(owner_index);
+    auto* first_retiring = sched.get_worker(1);
+    sched.start();
+    sched.go_to(owner_index, [worker, &fd, &read_on_owner]() -> task<void> {
+        std::uint64_t value = 0;
+        const auto result = co_await elio::io::async_read(fd.get(), &value, sizeof(value));
+        read_on_owner.store(result.result == sizeof(value) && value == 1 &&
+                                worker_thread::current() == worker,
+                            std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(2);
+    while (!worker->io_context().has_pending() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(worker->io_context().has_pending());
+    sched.set_thread_count(1);
+    if (owner_index != 1) {
+        // Make the existing wait hook unambiguously refer to the I/O owner.
+        const auto retire_deadline = std::chrono::steady_clock::now() + scaled_sec(2);
+        while (first_retiring->is_running() && std::chrono::steady_clock::now() < retire_deadline) {
+            std::this_thread::yield();
+        }
+        REQUIRE_FALSE(first_retiring->is_running());
+    }
+    std::thread grower([&] { sched.set_thread_count(owner_index + 1); });
+    const bool waiting = wait_for_flag(grow_waiting, scaled_sec(2));
+    bool drained = false;
+    std::thread closer([&] { drained = sched.shutdown(scaled_sec(5)); });
+    const bool closed = wait_for_flag(admission_closed, scaled_sec(2));
+    grower.join();
+    const auto visible_count = sched.num_threads();
+    // The read cannot complete until the grow controller has relinquished the slot.
+    const bool wrote = ::eventfd_write(fd.get(), 1) == 0;
+    closer.join();
+
+    CHECK(waiting);
+    CHECK(closed);
+    CHECK(visible_count == owner_index);
+    CHECK(wrote);
+    CHECK(read_on_owner.load(std::memory_order_acquire));
+    CHECK(drained);
+}
+
 TEST_CASE("force shutdown interrupts grow waiting on a draining worker",
           "[scheduler][shutdown][resize][lifecycle][regression]") {
     scheduler sched(2);
@@ -856,6 +916,19 @@ TEST_CASE("force shutdown interrupts grow waiting on a draining worker",
     REQUIRE(grow_returned.load(std::memory_order_acquire));
     REQUIRE(shutdown_elapsed < scaled_ms(1000));
     REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("pre-start growth configures slots without starting workers",
+          "[scheduler][resize][lifecycle]") {
+    scheduler sched(1);
+    sched.set_thread_count(2);
+    REQUIRE(sched.num_threads() == 2);
+    auto* slot = sched.get_worker(1);
+    REQUIRE(slot != nullptr);
+    REQUIRE_FALSE(slot->is_running());
+    sched.start();
+    CHECK(slot->is_running());
+    CHECK(sched.shutdown(scaled_sec(2)));
 }
 
 TEST_CASE("scheduler destructor clears current after cross-thread shutdown",

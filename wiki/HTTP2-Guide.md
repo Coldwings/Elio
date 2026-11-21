@@ -99,6 +99,11 @@ coro::task<void> post_example() {
 }
 ```
 
+Request uploads are buffered, not streamed. After
+`h2_session::submit_request()` accepts a nonempty body, its DATA provider
+reads successive chunks from a session-owned copy without moving the unsent
+suffix. nghttp2 still determines frame sizes and applies flow control.
+
 ## Client Configuration
 
 ### h2_client_config

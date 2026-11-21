@@ -4277,64 +4277,62 @@ TEST_CASE("uds_stream read_exactly observes cancellation while waiting",
 }
 
 TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
-    auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
+    constexpr int num_clients = 3;
+    int connecting = num_clients;
+    SECTION("three clients connect concurrently") {}
+    SECTION("cancel the accept loop when only one client arrives") { connecting = 1; }
 
+    auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
     auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
-    
-    constexpr int NUM_CLIENTS = 3;
-    std::array<std::optional<uds_stream>, NUM_CLIENTS> server_streams;
-    std::array<std::optional<uds_stream>, NUM_CLIENTS> client_streams;
-    std::atomic<int> accepts_done{0};
-    std::atomic<int> connects_done{0};
-    
-    scheduler sched(4);
-    sched.start();
-    
-    // Clients may connect concurrently, but the listener supports one pending accept.
-    auto accept_all = [&]() -> task<void> {
+
+    std::array<std::optional<uds_stream>, num_clients> server_streams;
+    std::array<std::optional<uds_stream>, num_clients> client_streams;
+    std::atomic<int> accept_attempts{0}, accepts_done{0}, connects_done{0};
+    cancel_source stop;
+    const auto token = stop.get_token();
+
+    // Clients connect independently; only one accept may be pending on the listener.
+    auto accept_all = [&](scheduler& owner) -> task<void> {
         for (auto& stream : server_streams) {
-            stream = co_await listener->accept();
+            if (token.is_cancelled() || !owner.is_running()) co_return;
+            ++accept_attempts;
+            stream = co_await listener->accept(token);
+            if (!stream) co_return;
             ++accepts_done;
         }
     };
+    auto connect_one = [&](int index) -> task<void> {
+        client_streams[index] = co_await uds_connect(addr, token);
+        ++connects_done;
+    };
 
-    // Connect coroutines
-    auto connect0 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(addr);
-        client_streams[0] = std::move(stream);
-        connects_done++;
-        co_return;
-    };
-    auto connect1 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(addr);
-        client_streams[1] = std::move(stream);
-        connects_done++;
-        co_return;
-    };
-    auto connect2 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(addr);
-        client_streams[2] = std::move(stream);
-        connects_done++;
-        co_return;
-    };
-    
-    // Start all coroutines
-    sched.go(accept_all);
-    sched.go(connect0);
-    sched.go(connect1);
-    sched.go(connect2);
-    
+    scheduler sched(4);
+    sched.start();
+    sched.go(accept_all(sched));
+    for (int i = 0; i < connecting; ++i) sched.go(connect_one(i));
+
+    const bool reached = wait_for_uds_stream_test([&] {
+        return connects_done == connecting && accepts_done == connecting &&
+               (connecting == num_clients || accept_attempts == connecting + 1);
+    }, elio::test::scaled_ms(5000));
+    // Cancel any outstanding accept/connect before either shutdown or failure unwinds.
+    if (!reached || connecting < num_clients) stop.cancel();
     REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
-    
-    REQUIRE(accepts_done == NUM_CLIENTS);
-    REQUIRE(connects_done == NUM_CLIENTS);
-    
-    for (int i = 0; i < NUM_CLIENTS; ++i) {
+    REQUIRE(reached);
+    REQUIRE(accepts_done == connecting);
+    REQUIRE(connects_done == connecting);
+    REQUIRE(accept_attempts == (connecting == num_clients ? num_clients : connecting + 1));
+
+    for (int i = 0; i < connecting; ++i) {
         REQUIRE(server_streams[i].has_value());
         REQUIRE(client_streams[i].has_value());
         REQUIRE(server_streams[i]->is_valid());
         REQUIRE(client_streams[i]->is_valid());
+    }
+    for (int i = connecting; i < num_clients; ++i) {
+        CHECK_FALSE(server_streams[i]);
+        CHECK_FALSE(client_streams[i]);
     }
 }
 

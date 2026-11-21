@@ -118,6 +118,7 @@ jobs:
         retry_sudo apt-get update
         retry_sudo apt-get install -y \
           cmake \
+          gdb \
           ninja-build \
           liburing-dev \
           libssl-dev \
@@ -149,10 +150,14 @@ jobs:
     - name: Run unit tests
       if: needs.changes.outputs.code == 'true'
       shell: bash
+      env:
+        ELIO_CI_BUILD_TYPE: ${{ matrix.build_type }}
       run: |
-        set -o pipefail
+        set -euo pipefail
         mkdir -p test-logs
-        ./build/tests/elio_tests --reporter compact --abort 2>&1 \
+        python3 tests/unit/test_native_ci_stacks.py ./build/tests/elio_test_watchdog_probe_normal 2>&1 \
+          | tee test-logs/native-observer-smoke.log
+        python3 tools/run-native-ci-test.py ./build/tests/elio_tests --reporter compact --abort 2>&1 \
           | tee test-logs/catch-normal.log
 
     - name: Run ASAN tests
@@ -175,12 +180,17 @@ jobs:
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
       shell: bash
       run: |
-        set -o pipefail
-        # Keep every test and its original timeout; the new deadline matrix
-        # must not consume the existing suite's process-wide watchdog budget.
-        ./build/tests/elio_tests_tsan '~[http_client_streaming]' \
-          --reporter compact --durations yes --abort 2>&1 \
-          | tee test-logs/catch-tsan-core.log
+        set -euo pipefail
+        # Keep the 600s per-process watchdog and all individual test timeouts.
+        core_seed=$(date +%s)
+        shard_count=2
+        echo "TSAN core: $shard_count shards; Catch2 RNG seed $core_seed"
+        for ((shard=0; shard<shard_count; ++shard)); do
+          ./build/tests/elio_tests_tsan '~[http_client_streaming]' \
+            --shard-count "$shard_count" --shard-index "$shard" --order decl --rng-seed "$core_seed" \
+            --reporter compact --durations yes --abort 2>&1 \
+            | tee "test-logs/catch-tsan-core-$shard.log"
+        done
         ./build/tests/elio_tests_tsan '[http_client_streaming]' \
           --reporter compact --durations yes --abort 2>&1 \
           | tee test-logs/catch-tsan-http-client-streaming.log

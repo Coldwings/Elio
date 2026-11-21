@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP/2 buffered uploads advance through the owned request body without
   repeatedly moving unsent bytes between DATA frames (#1304).
 
+- `io::read_file()` checks for EOF before growing a full output string, avoiding
+  large temporary allocations on stable files while still reading growth (#1314).
+
 ## [0.6.0] - 2026-10-12
 
 This is the first formal 0.6 release. It includes intentional API and

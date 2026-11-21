@@ -4291,24 +4291,12 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     scheduler sched(4);
     sched.start();
     
-    // Accept coroutines
-    auto accept0 = [&]() -> task<void> {
-        auto stream = co_await listener->accept();
-        server_streams[0] = std::move(stream);
-        accepts_done++;
-        co_return;
-    };
-    auto accept1 = [&]() -> task<void> {
-        auto stream = co_await listener->accept();
-        server_streams[1] = std::move(stream);
-        accepts_done++;
-        co_return;
-    };
-    auto accept2 = [&]() -> task<void> {
-        auto stream = co_await listener->accept();
-        server_streams[2] = std::move(stream);
-        accepts_done++;
-        co_return;
+    // Clients may connect concurrently, but the listener supports one pending accept.
+    auto accept_all = [&]() -> task<void> {
+        for (auto& stream : server_streams) {
+            stream = co_await listener->accept();
+            ++accepts_done;
+        }
     };
 
     // Connect coroutines
@@ -4332,19 +4320,12 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     };
     
     // Start all coroutines
-    sched.go(accept0);
-    sched.go(accept1);
-    sched.go(accept2);
+    sched.go(accept_all);
     sched.go(connect0);
     sched.go(connect1);
     sched.go(connect2);
     
-    // Wait until all connections are made
-    for (int i = 0; i < 500 && (accepts_done < NUM_CLIENTS || connects_done < NUM_CLIENTS); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    
-    sched.shutdown();
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
     
     REQUIRE(accepts_done == NUM_CLIENTS);
     REQUIRE(connects_done == NUM_CLIENTS);

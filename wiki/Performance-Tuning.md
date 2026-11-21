@@ -76,11 +76,11 @@ This is deliberately not the previous idle-flag lazy-wake optimization. The
 producer never decides that a wake is unnecessary from a sampled worker state;
 that approach had a race which caused 10 ms tail latency on weak hardware.
 
-The MPSC ring remains the normal submission path. If it stays full after
-bounded retries, the worker accepts the handle through a locked overflow queue.
-That slow path trades burst-only synchronization for correctness: a borrowed
-resume handle stays assigned to its worker rather than running on the producer
-thread or being destroyed.
+The MPSC ring remains the normal submission path. If it is full, the producer
+publishes the handle to that worker's locked overflow queue without spinning
+for a free ring slot. A borrowed resume handle stays assigned to its worker.
+Overflow can allocate, and neither queue is an application-level admission
+limit: producers that need to bound pending work must limit their submissions.
 
 ### Owner-Local Continuations
 

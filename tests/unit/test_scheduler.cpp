@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <coroutine>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
 
 using namespace elio::runtime;
@@ -906,6 +908,45 @@ TEST_CASE("Scheduler coalesces external submission wakes while a worker is busy"
         check_submission_wake_burst(
             elio::io::io_context::backend_type::io_uring);
     }
+}
+
+TEST_CASE("Full worker inbox admits overflow once and preserves rejected handles",
+          "[scheduler][inbox][overflow][regression]") {
+    constexpr size_t capacity = mpsc_queue<void>::capacity;
+    std::vector<std::atomic<int>> hits(capacity + 2);
+    scheduler sched(1);
+    sched.pause();
+    sched.start();
+    auto* worker = sched.get_worker(0);
+    REQUIRE(worker != nullptr);
+    for (size_t i = 0; i < capacity; ++i) {
+        sched.go_to(0, increment_counter_task(&hits[i]));
+    }
+    // The ring is genuinely full. Accept one overflow entry, then fail the
+    // next insertion and retry that same unpublished handle before draining.
+    sched.go_to(0, increment_counter_task(&hits[capacity]));
+    auto handle = elio::coro::detail::task_access::release(
+        increment_counter_task(&hits.back()));
+    auto& fail = elio::runtime::detail::fail_task_overflow_allocation_for_test;
+    fail.store(true);
+    const bool accepted_on_failure = worker->schedule(handle);
+    fail.store(false);
+    const bool accepted = accepted_on_failure || worker->schedule(handle);
+    if (!accepted) handle.destroy();
+    const auto pending = worker->queue_size();
+
+    sched.resume();
+    const bool raw_task_ran = wait_for_scheduler_condition([&] {
+        return hits.back().load() != 0;
+    });
+    const bool stopped = sched.shutdown(scaled_sec(5));
+    CHECK_FALSE(accepted_on_failure);
+    CHECK(accepted);
+    CHECK(pending == hits.size());
+    CHECK(raw_task_ran);
+    REQUIRE(stopped);
+    CHECK(std::all_of(hits.begin(), hits.end(),
+                      [](const auto& hit) { return hit.load() == 1; }));
 }
 
 TEST_CASE("Scheduler rechecks skipped submissions before blocking",

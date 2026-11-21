@@ -124,6 +124,35 @@ static_assert(!std::is_move_assignable_v<h2_session>);
 static_assert(std::is_move_constructible_v<h2_client>);
 static_assert(std::is_move_assignable_v<h2_client>);
 
+TEST_CASE("HTTP/2 upload providers retain independent binary bodies across pulls",
+          "[http2][upload]") {
+    std::string input("a\0bcd", 5);
+    detail::h2_upload_body first(input);
+    input.assign("xyz");
+    detail::h2_upload_body second(input);
+    input.clear();
+
+    auto a = first.provider();
+    auto b = second.provider();
+    auto pull = [](nghttp2_data_provider& provider, size_t length,
+                   std::string_view expected, bool eof) {
+        std::array<uint8_t, 8> out{};
+        uint32_t flags = 0;
+        const auto count = provider.read_callback(nullptr, 1, out.data(), length,
+                                                  &flags, &provider.source, nullptr);
+        REQUIRE(count == static_cast<ssize_t>(expected.size()));
+        REQUIRE(std::string_view(reinterpret_cast<const char*>(out.data()),
+                                 expected.size()) == expected);
+        REQUIRE(((flags & NGHTTP2_DATA_FLAG_EOF) != 0) == eof);
+    };
+    pull(a, 2, std::string_view("a\0", 2), false);
+    pull(b, 1, "x", false);
+    pull(a, 1, "b", false);
+    pull(b, 8, "yz", true);
+    pull(a, 2, "cd", true);
+    pull(a, 8, "", true);
+}
+
 TEST_CASE("HTTP/2 error codes", "[http2]") {
     SECTION("Error code values match nghttp2") {
         REQUIRE(static_cast<int>(h2_error::none) == 0);

@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The epoll fallback continues servicing ready descriptors and expired timers
   during sustained regular-file I/O or queued closes (#1305).
 
+- Graceful shutdown no longer stops an I/O owner early when a concurrent grow
+  is waiting to reuse its retiring worker slot (#1312).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease
@@ -20,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers service requeued owner tasks in bounded turns. Foreign wakeups,
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
+
+### Changed
+
+- HTTP/2 buffered uploads advance through the owned request body without
+  repeatedly moving unsent bytes between DATA frames (#1304).
 
 ## [0.6.0] - 2026-10-12
 

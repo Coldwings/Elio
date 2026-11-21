@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/io/file_helpers.hpp>
 #include <elio/coro/task.hpp>
@@ -604,4 +605,28 @@ TEST_CASE("file_helpers: read_dir on non-existent path returns nullopt", "[io][f
 
     auto entries = read_dir(path);
     REQUIRE_FALSE(entries.has_value());
+}
+
+TEST_CASE("file_helpers: read_dir distinguishes an enumeration error from EOF",
+          "[io][file_helpers][directory-error]") {
+    dirent entry{};
+    std::strcpy(entry.d_name, "first");
+    const bool fail = GENERATE(false, true);
+    int calls = 0;
+    const auto result = elio::io::detail::read_dir_with(".", [&](DIR*) -> dirent* {
+        if (calls++ == 0) {
+            errno = EINTR; // stale after a successful read
+            return &entry;
+        }
+        if (fail) errno = EIO;
+        return nullptr;
+    });
+    REQUIRE(calls == 2);
+    if (fail) {
+        REQUIRE_FALSE(result.has_value());
+    } else {
+        REQUIRE(result.has_value());
+        REQUIRE(result->size() == 1);
+        CHECK(result->front().name == "first");
+    }
 }

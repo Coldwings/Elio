@@ -118,6 +118,7 @@ jobs:
         retry_sudo apt-get update
         retry_sudo apt-get install -y \
           cmake \
+          gdb \
           ninja-build \
           liburing-dev \
           libssl-dev \
@@ -149,10 +150,14 @@ jobs:
     - name: Run unit tests
       if: needs.changes.outputs.code == 'true'
       shell: bash
+      env:
+        ELIO_CI_BUILD_TYPE: ${{ matrix.build_type }}
       run: |
-        set -o pipefail
+        set -euo pipefail
         mkdir -p test-logs
-        ./build/tests/elio_tests --reporter compact --abort 2>&1 \
+        python3 tests/unit/test_native_ci_stacks.py ./build/tests/elio_test_watchdog_probe_normal 2>&1 \
+          | tee test-logs/native-observer-smoke.log
+        python3 tools/run-native-ci-test.py ./build/tests/elio_tests --reporter compact --abort 2>&1 \
           | tee test-logs/catch-normal.log
 
     - name: Run ASAN tests

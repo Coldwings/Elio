@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <cerrno>
+#include <memory>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -218,18 +220,26 @@ struct dir_entry {
     bool is_symlink;        ///< True if symbolic link
 };
 
-/// Read directory contents
-/// Returns list of entries, or nullopt on error
-inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
+namespace detail {
+
+template<typename Next>
+std::optional<std::vector<dir_entry>> read_dir_with(const std::string& path, Next next) {
     std::vector<dir_entry> entries;
-    
-    DIR* dir = opendir(path.c_str());
+    auto close_dir = [](DIR* value) noexcept { ::closedir(value); };
+    std::unique_ptr<DIR, decltype(close_dir)> dir(::opendir(path.c_str()), close_dir);
     if (!dir) {
         return std::nullopt;
     }
     
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
+    for (;;) {
+        // At EOF readdir leaves errno unchanged, even after a previous
+        // entry's metadata lookup failed.
+        errno = 0;
+        auto* entry = next(dir.get());
+        if (!entry) {
+            if (errno != 0) return std::nullopt;
+            break;
+        }
         std::string name(entry->d_name);
         
         // Skip . and ..
@@ -268,8 +278,14 @@ inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
         entries.push_back(std::move(e));
     }
     
-    closedir(dir);
     return entries;
+}
+
+} // namespace detail
+
+/// Read directory contents, or return nullopt if opening or enumerating fails.
+inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
+    return detail::read_dir_with(path, ::readdir);
 }
 
 } // namespace elio::io

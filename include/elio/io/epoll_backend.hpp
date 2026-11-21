@@ -149,6 +149,10 @@ public:
     epoll_backend& operator=(const epoll_backend&) = delete;
     epoll_backend(epoll_backend&&) = delete;
     epoll_backend& operator=(epoll_backend&&) = delete;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] int epoll_fd_for_test() const noexcept { return epoll_fd_; }
+#endif
     
     /// Prepare an I/O operation
     bool prepare(const io_request& req) override {
@@ -384,6 +388,7 @@ public:
             state.events = requested_events;
         }
         
+        op.interest = events;
         state.pending_ops.push_back(std::move(op));
         if (is_sync) {
             pending_sync_ops_++;
@@ -575,6 +580,8 @@ public:
                         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                     }
                     fd_states_.erase(it);
+                } else {
+                    narrow_duplex_interest(fd, state);
                 }
             }
         
@@ -658,6 +665,8 @@ public:
                                   nullptr);
                     }
                     fd_states_.erase(state_it);
+                } else {
+                    narrow_duplex_interest(state_it->first, state);
                 }
                 goto found;
             }
@@ -761,6 +770,7 @@ private:
         io_request req;
         std::coroutine_handle<> awaiter;
         bool synchronous = false;
+        uint32_t interest = 0;
         io_result precompleted_result{0, 0};
         /// True for ready-queue entries whose result is already computed
         /// (see queue_ready_op). cancel() must not claim them: the real
@@ -791,6 +801,25 @@ private:
         fd_kind kind = fd_kind::unknown;
     };
     
+    void narrow_duplex_interest(int fd, fd_state& state) noexcept {
+        if (!state.registered || state.events != (EPOLLIN | EPOLLOUT)) return;
+        uint32_t remaining = 0;
+        for (const auto& op : state.pending_ops) {
+            remaining |= op.interest;
+            if (remaining == state.events) return;
+        }
+        // Only a queued synchronous close remains; its drain deregisters
+        // before closing. Otherwise keep the old mask until MOD succeeds:
+        // it still covers every pending op if the kernel rejects narrowing.
+        if (remaining == 0) return;
+        epoll_event ev{};
+        ev.events = remaining;
+        ev.data.fd = fd;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+            state.events = remaining;
+        }
+    }
+
     /// Timer entry for the timer queue
     struct timer_entry {
         std::chrono::steady_clock::time_point deadline;

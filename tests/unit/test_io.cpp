@@ -25,6 +25,7 @@
 #include <dirent.h>
 #endif
 #include <sys/socket.h>
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -1163,6 +1164,41 @@ TEST_CASE("epoll timeout conversion clamps values above INT_MAX",
     REQUIRE(elio::io::detail::min_epoll_timeout(
                 50, std::chrono::milliseconds(0))
             == 0);
+}
+
+TEST_CASE("epoll removes writable interest when only a read remains",
+          "[io][epoll][directional-interest]") {
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+    op_state write_state{}, read_state{};
+    epoll_backend backend;
+    io_request rd{};
+    rd.fd = sv[0];
+    rd.op = io_op::poll_read;
+    rd.state = &read_state;
+    io_request wr = rd;
+    wr.op = io_op::poll_write;
+    wr.state = &write_state;
+    REQUIRE(backend.prepare(rd));
+    REQUIRE(backend.prepare(wr));
+    SECTION("write completes") {
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+        CHECK(write_state.result == 0);
+    }
+    SECTION("write is cancelled") {
+        (void)backend.cancel(tagged_op_state_user_data(&write_state));
+        CHECK(write_state.result == -ECANCELED);
+    }
+    REQUIRE(backend.pending_count() == 1);
+    // The kernel epoll fd itself is readable if a stale level-triggered
+    // EPOLLOUT would wake the next worker poll. No timing threshold needed.
+    pollfd probe{backend.epoll_fd_for_test(), POLLIN, 0};
+    CHECK(::poll(&probe, 1, 0) == 0);
+    REQUIRE(::write(sv[1], "x", 1) == 1);
+    CHECK(backend.poll(std::chrono::milliseconds(0)) == 1);
+    CHECK(read_state.phase == op_state::phase_completed);
+    REQUIRE(::close(sv[0]) == 0);
+    REQUIRE(::close(sv[1]) == 0);
 }
 
 TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][epoll][registration]") {

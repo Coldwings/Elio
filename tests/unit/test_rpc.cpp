@@ -4956,7 +4956,7 @@ TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is
         (void)co_await client->send_oneway<OnewayNoResponseMethod>(TestRequest{1});
     });
     const auto limit = elio::test::scaled_sec(5);
-    REQUIRE(writing.wait_for(limit) == std::future_status::ready);
+    const auto writing_status = writing.wait_for(limit);
 
     // Once a sender announces entry, the single worker cannot run its
     // successor (or the awakened writer) until that sender suspends.
@@ -4974,20 +4974,29 @@ TEST_CASE("queued RPC calls receive the send mutex or cancel while the sender is
             trace->call_result.set_value(result && result.value().result == "ok");
         }
     });
-    REQUIRE(call_started.wait_for(limit) == std::future_status::ready);
+    const auto call_started_status = call_started.wait_for(limit);
     sched.go([client, trace]() -> coro::task<void> {
         trace->oneway_started.set_value();
         trace->oneway_result.set_value(
             co_await client->send_oneway<OnewayNoResponseMethod>(TestRequest{3}));
     });
-    REQUIRE(oneway_started.wait_for(limit) == std::future_status::ready);
-    if (cancel_call) trace->cancel.cancel();
-    else trace->release.set();
+    const auto oneway_started_status = oneway_started.wait_for(limit);
+    if (cancel_call) {
+        sched.go([trace]() -> coro::task<void> {
+            trace->cancel.cancel();
+            co_return;
+        });
+    } else {
+        trace->release.set();
+    }
     auto call_status = call.wait_for(limit);
     if (cancel_call) trace->release.set();
     auto oneway_status = oneway.wait_for(limit);
     client->close();
     REQUIRE(sched.shutdown(limit));
+    REQUIRE(writing_status == std::future_status::ready);
+    REQUIRE(call_started_status == std::future_status::ready);
+    REQUIRE(oneway_started_status == std::future_status::ready);
     REQUIRE(call_status == std::future_status::ready);
     REQUIRE(oneway_status == std::future_status::ready);
     REQUIRE(call.get());

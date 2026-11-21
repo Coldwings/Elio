@@ -411,6 +411,9 @@ Concurrent calls on a client share a send mutex so their frames cannot
 interleave. If another write holds the mutex, a call queues for a handoff
 without polling. Its deadline and caller cancellation still apply while it
 waits; if cancellation wins the mutex wait, no request frame is sent.
+Request cancellation of an outstanding RPC from an Elio context. If the stop
+signal originates on a non-Elio thread, post the cancellation to the scheduler
+running the call; the RPC client does not provide that dispatch.
 
 ### Synchronous Handlers
 

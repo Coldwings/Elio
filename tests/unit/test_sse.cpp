@@ -2066,6 +2066,24 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     } observer;
     http::detail::observe_client_response_read_entry_for_test.store(false);
     http::detail::client_response_read_staged_for_test.store(false);
+    http::detail::sse_reconnect_wait_ms_for_test.store(-1);
+
+    std::string retry_field;
+    int configured_retry_ms = 7;
+    int expected_retry_ms = 7;
+    SECTION("no server retry uses the configured default") {}
+    SECTION("a zero server retry retains the configured fallback") {
+        retry_field = "retry: 0\n";
+    }
+    SECTION("a positive server retry overrides the configured default") {
+        retry_field = "retry: 11\n";
+        expected_retry_ms = 11;
+    }
+    SECTION("a nonpositive configured default does not delay reconnect") {
+        configured_retry_ms = -1;
+        expected_retry_ms = 0;
+    }
+    CAPTURE(retry_field, configured_retry_ms);
 
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
@@ -2090,7 +2108,7 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
             co_return false;
         }
         const auto request = co_await read_request_headers(*first);
-        const std::string body = "retry: 0\ndata: initial\n\n";
+        const std::string body = retry_field + "data: initial\n\n";
         const bool sent = !request.empty() && co_await write_all(*first,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
             "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
@@ -2109,7 +2127,7 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     auto client_root = sched.go_joinable([&]() -> coro::task<observation> {
         observation result;
         client_config config;
-        config.default_retry_ms = 1;
+        config.default_retry_ms = configured_retry_ms;
         config.max_reconnect_attempts = 1;
         sse_client client(config);
         result.connected = co_await client.connect(
@@ -2156,6 +2174,7 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     REQUIRE(client.value->connected);
     REQUIRE(client.value->first_event);
     REQUIRE(client.value->cancelled);
+    REQUIRE(http::detail::sse_reconnect_wait_ms_for_test.load() == expected_retry_ms);
 }
 #endif
 

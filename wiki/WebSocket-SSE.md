@@ -323,6 +323,11 @@ For SSE, the per-receive token also covers automatic reconnect backoff and
 connection setup initiated by that receive call; the original connect token
 remains independently effective.
 
+For an SSE reconnect, the last positive server `retry:` value overrides
+`default_retry_ms`. With no server retry value, or after `retry: 0`, the
+client uses the current `default_retry_ms` (3000 ms by default). A nonpositive
+configured default requests no delay.
+
 ### SSE Event Format
 
 For managed responses, `sse::event_view::id` is an

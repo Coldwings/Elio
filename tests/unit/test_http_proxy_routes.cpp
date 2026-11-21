@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <poll.h>
+#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2890,9 +2891,14 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
     co_return reached && result == elio::coro::cancel_result::completed;
 }
 
+struct direct_peer_handshake_gate {
+    elio::sync::event& permit;
+    std::binary_semaphore arrived{0};
+};
+
 task<void> serve_direct_output(elio::net::tcp_listener& listener,
         elio::tls::tls_context& context, direct_output_observation& observed,
-        elio::coro::cancel_token token) {
+        elio::coro::cancel_token token, direct_peer_handshake_gate* handshake_gate = nullptr) {
     observed.server_accept_entered.store(true, std::memory_order_release);
     size_t empty_connections = 0;
     auto accepted = co_await accept_fixture_payload(
@@ -2901,6 +2907,11 @@ task<void> serve_direct_output(elio::net::tcp_listener& listener,
         empty_connections, std::memory_order_release);
     if (!accepted) co_return;
     observed.server_accepted.store(true, std::memory_order_release);
+    if (handshake_gate) {
+        handshake_gate->arrived.release();
+        if (co_await handshake_gate->permit.wait(token) != elio::coro::cancel_result::completed)
+            co_return;
+    }
     elio::tls::tls_stream stream(std::move(*accepted), context);
     observed.server_handshake_entered.store(true, std::memory_order_release);
     const bool handshake_ok = co_await stream.handshake(token);
@@ -3479,6 +3490,39 @@ TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
     CHECK(owner->admission_counters_for_test().live == 0);
 }
 
+TEST_CASE("Direct TLS fixture can cancel an accepted peer before its handshake",
+          "[http][tls][retirement][retry-gate][issue-1328][http_client_streaming]") {
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    empty_connection_probe peer;
+    REQUIRE(peer.fd >= 0);
+    const auto address = elio::net::ipv4_address(
+        "127.0.0.1", listener->local_address().port()).to_sockaddr();
+    REQUIRE(::connect(peer.fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::send(peer.fd, "x", 1, MSG_NOSIGNAL) == 1);
+
+    direct_output_observation observed;
+    elio::tls::tls_context context(elio::tls::tls_mode::server);
+    elio::sync::event permit;
+    direct_peer_handshake_gate gate{permit};
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_direct_output(
+        *listener, context, observed, stop.get_token(), &gate));
+    const bool accepted = gate.arrived.try_acquire_for(std::chrono::seconds(10));
+    stop.cancel();
+    const bool finished_without_opening_gate = scheduler.wait_for_idle(std::chrono::seconds(10));
+    permit.set();  // Allow cleanup even if the cancellation assertion would fail.
+    ::shutdown(peer.fd, SHUT_RDWR);
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    server.await_resume();
+    CHECK(accepted);
+    CHECK(finished_without_opening_gate);
+    CHECK_FALSE(observed.server_handshake_entered.load(std::memory_order_acquire));
+}
+
 TEST_CASE("Direct TLS retry waits for the failed physical root to close",
           "[http][tls][retirement][retry][issue-1272][http_client_streaming]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
@@ -3520,11 +3564,19 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
     elio::coro::cancel_source stop;
     elio::runtime::scheduler scheduler(2);
     scheduler.start();
+    // Don't let the mismatched certificate cancel the first pump before it
+    // reaches the inactive hook that this test deliberately retains.
+    direct_peer_handshake_gate first_gate{observed.first.output.paused};
     auto first_server = scheduler.go_joinable(serve_direct_output(
-        *first_listener, first_context, observed.first, stop.get_token()));
+        *first_listener, first_context, observed.first, stop.get_token(), &first_gate));
     auto second_server = scheduler.go_joinable(serve_direct_output(
         *second_listener, second_context, second_observed, stop.get_token()));
     struct retry_snapshot {
+        direct_phase_diagnostics first;
+        const char* phase_before_recovery = "none";
+        size_t dns_before_recovery = 0, dials_before_recovery = 0, tls_before_recovery = 0;
+        bool held_before_recovery = false, call_ready_before_recovery = false;
+        bool second_accepted_before_recovery = false;
         bool pause_reached = false;
         bool failure_observed = false;
         bool root_wait_observed = false;
@@ -3542,31 +3594,49 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
         elio::coro::cancel_source call_stop;
         std::optional<elio::coro::join_handle<client_result<response>>> call;
         client_result<response> result;
+        const char* phase = "submit";
+        auto capture = [&]() noexcept {
+            if (snapshot.first.captured) return;
+            capture_direct_phases(&snapshot.first);
+            snapshot.phase_before_recovery = phase;
+            snapshot.dns_before_recovery = observed.dns_calls.load(std::memory_order_acquire);
+            snapshot.dials_before_recovery = observed.dials.load(std::memory_order_acquire);
+            snapshot.tls_before_recovery = observed.tls_sessions.load(std::memory_order_acquire);
+            snapshot.held_before_recovery = observed.first.output.held.load(std::memory_order_acquire);
+            snapshot.call_ready_before_recovery = call && call->is_ready();
+            snapshot.second_accepted_before_recovery =
+                second_observed.server_accepted.load(std::memory_order_acquire);
+        };
+        auto before_recovery = [](void* ctx) noexcept { (*static_cast<decltype(capture)*>(ctx))(); };
+        auto await_phase = [&](elio::sync::event& event, const char* name) -> task<bool> {
+            phase = name;
+            co_return co_await await_fixture_phase(event, observed.first.output, call_stop,
+                                                  snapshot.failure, &capture, before_recovery);
+        };
         try {
             call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
-            snapshot.pause_reached = co_await await_fixture_phase(
-                observed.first.output.paused, observed.first.output, call_stop, snapshot.failure);
-            snapshot.failure_observed = co_await await_fixture_phase(
-                observed.first.handshake_failed, observed.first.output,
-                call_stop, snapshot.failure);
-            snapshot.root_wait_observed = co_await await_fixture_phase(
-                observed.waiting_for_root, observed.first.output, call_stop, snapshot.failure);
+            snapshot.pause_reached = co_await await_phase(observed.first.output.paused, "output pause");
+            snapshot.failure_observed = co_await await_phase(observed.first.handshake_failed, "handshake failure");
+            snapshot.root_wait_observed = co_await await_phase(observed.waiting_for_root, "root wait");
             snapshot.dials_before_barrier = observed.dials.load(std::memory_order_acquire);
             snapshot.tls_sessions_before_barrier =
                 observed.tls_sessions.load(std::memory_order_acquire);
             snapshot.root_released_before_barrier =
                 observed.root_released.load(std::memory_order_acquire);
-            snapshot.first_open_before_barrier = ::fcntl(observed.first.fd, F_GETFD) >= 0;
+            snapshot.first_open_before_barrier = snapshot.pause_reached &&
+                ::fcntl(observed.first.fd, F_GETFD) >= 0;
             snapshot.request_ready_before_barrier = call->is_ready();
             finish_fixture_output(observed.first.output, call_stop, snapshot.failure);
-            snapshot.second_dial_observed = co_await await_fixture_phase(
-                observed.second_dial, observed.first.output, call_stop, snapshot.failure);
+            snapshot.second_dial_observed = co_await await_phase(observed.second_dial, "second dial");
+            phase = "request completion";
             snapshot.request_completed_after_second_dial = co_await await_fixture_ready(
-                *call, observed.first.output, call_stop, snapshot.failure);
+                *call, observed.first.output, call_stop, snapshot.failure, std::chrono::seconds(10),
+                &capture, before_recovery);
             result = co_await await_fixture_result(
-                *call, observed.first.output, call_stop, snapshot.failure);
+                *call, observed.first.output, call_stop, snapshot.failure, &capture, before_recovery);
             snapshot.shutdown_result = co_await owner->shutdown();
         } catch (...) {
+            capture();
             if (!snapshot.failure) snapshot.failure = std::current_exception();
             finish_fixture_output(observed.first.output, call_stop, snapshot.failure, true);
         }
@@ -3577,6 +3647,14 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
     stop.cancel();
     first_server.wait_destroyed();
     second_server.wait_destroyed();
+    CAPTURE(snapshot.phase_before_recovery, snapshot.dns_before_recovery, snapshot.dials_before_recovery,
+            snapshot.tls_before_recovery, snapshot.held_before_recovery, snapshot.call_ready_before_recovery,
+            snapshot.first.client_tls_created, snapshot.first.client_tls_failed,
+            snapshot.first.client_handshake_error, snapshot.first.client_verification,
+            snapshot.first.server_accept_entered, snapshot.first.server_accepted,
+            snapshot.first.server_empty_connections, snapshot.first.server_handshake_entered,
+            snapshot.first.server_handshake_finished, snapshot.first.server_handshake_error,
+            snapshot.second_accepted_before_recovery);
     REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
     const auto result = controlled.await_resume();
     first_server.await_resume();

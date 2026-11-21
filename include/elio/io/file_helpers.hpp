@@ -2,9 +2,12 @@
 
 #include "io_awaitables.hpp"
 #include <elio/coro/task.hpp>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <optional>
+#include <cerrno>
+#include <memory>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -59,12 +62,14 @@ private:
     int fd_;
 };
 
-/// Read a file's content into a string, in chunks.
-/// An engaged result contains the bytes actually read; it is not a
-/// completeness guarantee: a read failure after bytes were accumulated
-/// still returns the partial content. Returns nullopt only when the file
-/// cannot be opened or the first read fails before any bytes are produced.
-inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
+namespace detail {
+
+/// Await read(fd, dst, count, offset) for a positional read. On success, result
+/// is the byte count (0..count, zero at EOF); success() is false on error.
+/// The adapter must not access dst after completion. At a full buffer the
+/// destination is a one-byte probe used to decide whether growth is needed.
+template<typename Read>
+coro::task<std::optional<std::string>> read_file_with(const std::string& path, Read read) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         co_return std::nullopt;
@@ -81,40 +86,54 @@ inline coro::task<std::optional<std::string>> read_file(const std::string& path)
     }
 
     // Read the file in chunks, handling TOCTOU where file size may change
-    std::string buffer;
-    buffer.reserve(initial_size > 0 ? initial_size : 4096);
+    const size_t initial_window = initial_size > 0 ? initial_size : 4096;
+    constexpr size_t max_chunk = 1024 * 1024;
+    std::string buffer(initial_window, '\0');
 
     size_t total_read = 0;
     while (true) {
-        // Ensure we have space to read
-        size_t capacity = buffer.capacity();
-        if (total_read >= capacity) {
-            // Double the buffer size
-            buffer.resize(capacity * 2);
-        } else {
-            buffer.resize(capacity);
+        // After confirmed growth, expose reserved capacity one read at a time.
+        if (total_read == buffer.size() && total_read > initial_window) {
+            buffer.resize(total_read + std::min(buffer.capacity() - total_read, max_chunk));
         }
-
-        // Read a chunk
-        size_t chunk = std::min(buffer.size() - total_read, size_t(1024 * 1024)); // 1MB chunks
-        auto result = co_await async_read(fd,
-            buffer.data() + total_read, chunk,
-            static_cast<int64_t>(total_read));
+        // A full buffer usually means EOF at the stat estimate. Only grow
+        // after reading one more byte; normal chunks go straight to the result.
+        char extra;
+        const bool probe = total_read == buffer.size();
+        const size_t chunk = probe ? 1 : std::min(buffer.size() - total_read, max_chunk);
+        auto result = co_await read(fd, probe ? &extra : buffer.data() + total_read,
+                                    chunk, static_cast<int64_t>(total_read));
 
         if (!result.success() || result.result == 0) {
-            // EOF or error - truncate to actual read size
-            buffer.resize(total_read);
-            buffer.shrink_to_fit();
             if (total_read == 0 && !result.success()) {
                 co_return std::nullopt;
+            }
+            if (total_read < buffer.size()) {
+                buffer.resize(total_read);
+                // A stat overestimate or a growth step may leave substantial slack.
+                buffer.shrink_to_fit();
             }
             co_return buffer;
         }
 
+        if (probe) {
+            buffer.push_back(extra);
+        }
         total_read += static_cast<size_t>(result.result);
     }
+}
 
-    co_return buffer;
+} // namespace detail
+
+/// Read a file's content into a string, in chunks.
+/// An engaged result contains the bytes actually read; it is not a
+/// completeness guarantee: a read failure after bytes were accumulated
+/// still returns the partial content. Returns nullopt only when the file
+/// cannot be opened or the first read fails before any bytes are produced.
+inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
+    return detail::read_file_with(path, [](int fd, char* dst, size_t n, int64_t offset) {
+        return async_read(fd, dst, n, offset);
+    });
 }
 
 /// Write entire content to file (creates/truncates)
@@ -201,18 +220,26 @@ struct dir_entry {
     bool is_symlink;        ///< True if symbolic link
 };
 
-/// Read directory contents
-/// Returns list of entries, or nullopt on error
-inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
+namespace detail {
+
+template<typename Next>
+std::optional<std::vector<dir_entry>> read_dir_with(const std::string& path, Next next) {
     std::vector<dir_entry> entries;
-    
-    DIR* dir = opendir(path.c_str());
+    auto close_dir = [](DIR* value) noexcept { ::closedir(value); };
+    std::unique_ptr<DIR, decltype(close_dir)> dir(::opendir(path.c_str()), close_dir);
     if (!dir) {
         return std::nullopt;
     }
     
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
+    for (;;) {
+        // At EOF readdir leaves errno unchanged, even after a previous
+        // entry's metadata lookup failed.
+        errno = 0;
+        auto* entry = next(dir.get());
+        if (!entry) {
+            if (errno != 0) return std::nullopt;
+            break;
+        }
         std::string name(entry->d_name);
         
         // Skip . and ..
@@ -251,8 +278,14 @@ inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
         entries.push_back(std::move(e));
     }
     
-    closedir(dir);
     return entries;
+}
+
+} // namespace detail
+
+/// Read directory contents, or return nullopt if opening or enumerating fails.
+inline std::optional<std::vector<dir_entry>> read_dir(const std::string& path) {
+    return detail::read_dir_with(path, ::readdir);
 }
 
 } // namespace elio::io

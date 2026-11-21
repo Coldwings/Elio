@@ -457,19 +457,14 @@ private:
     };
 
     coro::task<bool> lock_send_mutex_for_call(coro::cancel_token token) {
-        while (!token.is_cancelled()) {
-            if (send_mutex_.try_lock()) {
-                co_return true;
-            }
-
-            auto result = co_await time::sleep_for(
-                std::chrono::milliseconds(1), token);
-            if (result == coro::cancel_result::cancelled) {
-                co_return false;
-            }
+        if (token.is_cancelled()) {
+            co_return false;
         }
-
-        co_return false;
+        // Avoid allocating a cancellable waiter for an uncontended send.
+        if (send_mutex_.try_lock()) {
+            co_return true;
+        }
+        co_return co_await send_mutex_.lock(std::move(token)) == coro::cancel_result::completed;
     }
 
     coro::task<bool> write_call_frame(const frame_header& header,

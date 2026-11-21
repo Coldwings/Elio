@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <type_traits>
 #include <vector>
 
 namespace elio::runtime {
@@ -321,12 +322,12 @@ private:
     // A scale wrapper groups callbacks for the resize already performed by
     // its trigger. Dispatch the children without issuing another resize.
     template<typename... Handlers>
-    void dispatch_scale_handlers(scale_up<Handlers...>, bool success, size_t pending) {
+    void dispatch_scale_handlers(std::type_identity<scale_up<Handlers...>>, bool success, size_t pending) {
         (execute_single_action<Handlers>(success, pending), ...);
     }
 
     template<typename... Handlers>
-    void dispatch_scale_handlers(scale_down<Handlers...>, bool success, size_t pending,
+    void dispatch_scale_handlers(std::type_identity<scale_down<Handlers...>>, bool success, size_t pending,
                                  std::chrono::seconds idle_time) {
         (execute_single_action<Handlers>(success, pending, idle_time), ...);
     }
@@ -336,8 +337,8 @@ private:
     void execute_single_action(bool success, size_t pending) {
         using T = std::decay_t<Action>;
 
-        if constexpr (requires { dispatch_scale_handlers(T{}, success, pending); }) {
-            dispatch_scale_handlers(T{}, success, pending);
+        if constexpr (requires { dispatch_scale_handlers(std::type_identity<T>{}, success, pending); }) {
+            dispatch_scale_handlers(std::type_identity<T>{}, success, pending);
         } else if constexpr (std::is_same_v<T, log>) {
             Action{}(scheduler_, pending);
         } else if constexpr (std::is_same_v<T, null>) {
@@ -362,8 +363,8 @@ private:
     void execute_single_action(bool success, size_t pending, std::chrono::seconds idle_time) {
         using T = std::decay_t<Action>;
 
-        if constexpr (requires { dispatch_scale_handlers(T{}, success, pending, idle_time); }) {
-            dispatch_scale_handlers(T{}, success, pending, idle_time);
+        if constexpr (requires { dispatch_scale_handlers(std::type_identity<T>{}, success, pending, idle_time); }) {
+            dispatch_scale_handlers(std::type_identity<T>{}, success, pending, idle_time);
         } else if constexpr (std::is_same_v<T, log>) {
             Action{}(scheduler_, pending, idle_time);
         } else if constexpr (std::is_same_v<T, null>) {

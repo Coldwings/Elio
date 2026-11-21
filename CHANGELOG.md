@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Graceful shutdown no longer stops an I/O owner early when a concurrent grow
+  is waiting to reuse its retiring worker slot (#1312).
+- Autoscaler scale wrappers now dispatch nested handlers once per resize
+  request. A thrown resize reports failure and leaves the monitor running;
+  reaching a worker limit does not invoke any handlers (#1318).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease
@@ -20,12 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - HTTP/2 buffered uploads advance through the owned request body without
   repeatedly moving unsent bytes between DATA frames (#1304).
-
-### Fixed
-
-- Autoscaler scale wrappers now dispatch nested handlers once per resize
-  request. A thrown resize reports failure and leaves the monitor running;
-  reaching a worker limit does not invoke any handlers (#1318).
 
 ## [0.6.0] - 2026-10-12
 

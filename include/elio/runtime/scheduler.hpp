@@ -788,23 +788,18 @@ public:
                 old_count = num_threads_.load(std::memory_order_relaxed);
                 if (count > old_count) {
                     for (size_t i = old_count; i < count; ++i) {
+                        std::unique_ptr<worker_thread> new_worker;
                         if (workers_[i]) {
                             // Slot already populated by the ctor or a prior shrink.
                             // If the prior worker is still draining I/O, wait for its
                             // detached thread before restarting this slot in place.
                             wait_for_draining_worker_(i);
-                            (void)try_start_worker_during_resize_(workers_[i].get());
                         } else {
-                            auto worker = std::make_unique<worker_thread>(
+                            new_worker = std::make_unique<worker_thread>(
                                 this, i, wait_strategy_);
-                            (void)try_start_worker_during_resize_(worker.get());
-                            workers_[i] = std::move(worker);
                         }
+                        if (!try_activate_resize_slot_(i, std::move(new_worker))) break;
                     }
-                    // Publish the new size AFTER all slot writes are visible.
-                    // Shutdown waits for resize_in_progress_ to clear before
-                    // snapshotting this count, so every started worker is included.
-                    num_threads_.store(count, std::memory_order_release);
                 }
             } else if (count < old_count) {
                 // Hold the worker lock across the entire shrink transition.
@@ -1020,15 +1015,17 @@ private:
         return shutdown_started_;
     }
 
-    [[nodiscard]] bool try_start_worker_during_resize_(
-        worker_thread* worker) {
-        if (!worker) return false;
+    [[nodiscard]] bool try_activate_resize_slot_(
+        size_t index, std::unique_ptr<worker_thread> new_worker) {
         std::lock_guard<std::mutex> lock(shutdown_mutex_);
-        if (shutdown_started_ ||
-            !running_.load(std::memory_order_relaxed)) {
-            return false;
+        if (shutdown_started_) return false;
+        // Before start(), resize only configures slots. In either case publish
+        // this prefix under the lifecycle lock, never a skipped shutdown slot.
+        if (running_.load(std::memory_order_relaxed)) {
+            (new_worker ? new_worker.get() : workers_[index].get())->start();
         }
-        worker->start();
+        if (new_worker) workers_[index] = std::move(new_worker);
+        num_threads_.store(index + 1, std::memory_order_release);
         return true;
     }
 
@@ -1300,16 +1297,16 @@ private:
             detail::resize_waiting_for_draining_worker_for_test.notify_all();
 #endif
             while (worker->is_running()) {
-                if (shutdown_started_during_resize_()) {
-                    worker->request_stop();
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
+                if (shutdown_started_during_resize_()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             detail::resize_waiting_for_draining_worker_for_test.store(
                 false, std::memory_order_release);
 #endif
+            // Shutdown supersedes growth, not the owner's I/O. Leave its
+            // thread and accounting slot intact for drain/teardown.
+            if (worker->is_running()) return;
         }
         if (it->second.joinable()) it->second.join();
         if (worker) worker->leave_draining_mode();

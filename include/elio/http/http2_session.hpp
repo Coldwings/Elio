@@ -258,6 +258,33 @@ struct h2_session_config {
 
 namespace detail {
 
+class h2_upload_body {
+public:
+    explicit h2_upload_body(std::string_view body) : bytes_(body) {}
+
+    nghttp2_data_provider provider() noexcept {
+        nghttp2_data_provider result{};
+        result.source.ptr = this;
+        result.read_callback = [](nghttp2_session*, int32_t, uint8_t* buf,
+                                  size_t length, uint32_t* flags,
+                                  nghttp2_data_source* source, void*) noexcept -> ssize_t {
+            auto& body = *static_cast<h2_upload_body*>(source->ptr);
+            const size_t count = std::min(length, body.bytes_.size() - body.offset_);
+            if (count != 0) {
+                std::memcpy(buf, body.bytes_.data() + body.offset_, count);
+                body.offset_ += count;
+            }
+            if (body.offset_ == body.bytes_.size()) *flags |= NGHTTP2_DATA_FLAG_EOF;
+            return static_cast<ssize_t>(count);
+        };
+        return result;
+    }
+
+private:
+    const std::string bytes_;
+    size_t offset_ = 0;
+};
+
 inline int validate_h2_submit_request_fields(
     method m,
     const url& target,
@@ -383,34 +410,15 @@ public:
             }
         }
         
-        nghttp2_data_provider* data_prd = nullptr;
-        nghttp2_data_provider data_provider;
-        
-        // Store body in pending_bodies_ map so it outlives this function
         int32_t stream_id;
         if (!body.empty()) {
-            // Use a temporary stream id placeholder, we'll update after submit
-            auto body_ptr = std::make_shared<std::string>(body);
-            data_provider.source.ptr = body_ptr.get();
-            data_provider.read_callback = [](nghttp2_session*, int32_t, uint8_t* buf, 
-                                             size_t length, uint32_t* data_flags,
-                                             nghttp2_data_source* source, void*) -> ssize_t {
-                auto* body_str = static_cast<std::string*>(source->ptr);
-                size_t to_copy = std::min(length, body_str->size());
-                std::memcpy(buf, body_str->data(), to_copy);
-                body_str->erase(0, to_copy);
-                if (body_str->empty()) {
-                    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-                }
-                return static_cast<ssize_t>(to_copy);
-            };
-            data_prd = &data_provider;
-            
+            auto body_ptr = std::make_unique<detail::h2_upload_body>(body);
+            auto data_provider = body_ptr->provider();
             stream_id = nghttp2_submit_request(session_, nullptr, 
                                                nva.data(), nva.size(),
-                                               data_prd, nullptr);
+                                               &data_provider, nullptr);
             if (stream_id > 0) {
-                pending_bodies_[stream_id] = body_ptr;
+                pending_bodies_[stream_id] = std::move(body_ptr);
             }
         } else {
             stream_id = nghttp2_submit_request(session_, nullptr, 
@@ -766,7 +774,7 @@ private:
     tls::tls_stream* stream_ = nullptr;
     h2_session_config config_;
     std::unordered_map<int32_t, h2_stream> streams_;
-    std::unordered_map<int32_t, std::shared_ptr<std::string>> pending_bodies_;
+    std::unordered_map<int32_t, std::unique_ptr<detail::h2_upload_body>> pending_bodies_;
 };
 
 } // namespace elio::http

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <functional>
 #include <exception>
+#include <optional>
 #include <thread>
 #include <type_traits>
 
@@ -105,7 +106,7 @@ struct interim_cancel_guard {
     bool enabled_;
 };
 
-client_result<response> run_wire_response(std::string_view wire,
+client_result<response> run_wire_response(std::optional<std::string_view> wire,
         const std::function<void(elio::http::client_config&)>& configure = {},
         bool secure = false, std::exception_ptr* raised = nullptr,
         bool cancel_interim = false, request_api api = request_api::get,
@@ -126,17 +127,20 @@ client_result<response> run_wire_response(std::string_view wire,
     std::exception_ptr failure;
     elio::runtime::scheduler scheduler(2);
     scheduler.start();
-    scheduler.go([&]() -> task<void> {
-        auto stream = co_await listener->accept(cleanup.get_token());
-        accepted = stream.has_value();
-        if (!stream) co_return;
-        if (!secure) {
-            auto request = co_await read_headers(*stream, cleanup.get_token());
-            if (captured_request) *captured_request = std::move(request);
-        }
-        (void)co_await stream->write_exactly(wire, cleanup.get_token());
-        stream->shutdown_socket();
-    });
+    // An injected write can finish before accept runs; it only needs a listener.
+    if (wire) {
+        scheduler.go([&]() -> task<void> {
+            auto stream = co_await listener->accept(cleanup.get_token());
+            accepted = stream.has_value();
+            if (!stream) co_return;
+            if (!secure) {
+                auto request = co_await read_headers(*stream, cleanup.get_token());
+                if (captured_request) *captured_request = std::move(request);
+            }
+            (void)co_await stream->write_exactly(*wire, cleanup.get_token());
+            stream->shutdown_socket();
+        });
+    }
     scheduler.go([&]() -> task<void> {
         try {
             if (api == request_api::method_general) {
@@ -176,7 +180,7 @@ client_result<response> run_wire_response(std::string_view wire,
     REQUIRE(completed);
     if (raised) *raised = failure;
     else REQUIRE_FALSE(failure);
-    REQUIRE(accepted);
+    if (wire) REQUIRE(accepted);
     REQUIRE(client_done.load(std::memory_order_acquire));
     return result;
 }
@@ -249,10 +253,18 @@ client_result<response> run_stalled_response(bool body, bool cancel) {
     return result;
 }
 
-elio::io::io_result fail_request_write(std::string_view) { return {-EPIPE, 0}; }
-elio::io::io_result throw_request_write(std::string_view) { throw std::bad_alloc(); }
+std::atomic<unsigned> injected_writes{0};
+elio::io::io_result fail_request_write(std::string_view) {
+    injected_writes.fetch_add(1, std::memory_order_relaxed);
+    return {-EPIPE, 0};
+}
+elio::io::io_result throw_request_write(std::string_view) {
+    injected_writes.fetch_add(1, std::memory_order_relaxed);
+    throw std::bad_alloc();
+}
 struct write_failure_guard {
     explicit write_failure_guard(elio::http::detail::request_write_hook hook = fail_request_write) {
+        injected_writes.store(0, std::memory_order_relaxed);
         elio::http::detail::request_write_result_for_test.store(hook);
     }
     ~write_failure_guard() { elio::http::detail::request_write_result_for_test.store(nullptr); }
@@ -497,8 +509,9 @@ TEST_CASE("HTTP body limit error is distinct from framing failure", "[http][http
 
 TEST_CASE("HTTP write failures preserve request stage", "[http][http_client_result][write]") {
     write_failure_guard hook;
-    const auto result = run_wire_response("");
+    const auto result = run_wire_response(std::nullopt);
     require_failure(result, EPIPE, client_stage::request);
+    REQUIRE(injected_writes.load(std::memory_order_relaxed) == 1);
 }
 
 TEST_CASE("HTTP invalid TLS peer reports TLS stage", "[http][http_client_result][tls]") {
@@ -526,9 +539,10 @@ TEST_CASE("HTTP TLS cancellation and connect deadline retain TLS stage",
 TEST_CASE("HTTP value API does not swallow exceptional failures", "[http][http_client_result][exception]") {
     write_failure_guard hook(throw_request_write);
     std::exception_ptr failure;
-    (void)run_wire_response("", {}, false, &failure);
+    (void)run_wire_response(std::nullopt, {}, false, &failure);
     REQUIRE(failure);
     REQUIRE_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+    REQUIRE(injected_writes.load(std::memory_order_relaxed) == 1);
 }
 
 TEST_CASE("HTTP response cancellation reports the active read stage", "[http][http_client_result][cancel]") {

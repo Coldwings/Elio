@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External submissions to a full worker inbox now use its overflow queue
   immediately instead of spinning on the submitting thread (#1322).
 
+- HTTP/2 buffered uploads advance through the owned request body without
+  repeatedly moving unsent bytes between DATA frames (#1304).
+
 ## [0.6.0] - 2026-10-12
 
 This is the first formal 0.6 release. It includes intentional API and

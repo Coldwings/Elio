@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_helpers.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
@@ -34,6 +35,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -2473,6 +2475,42 @@ TEST_CASE("epoll stream destructor fails a parked read with -ECANCELED and "
     stream2.reset();
     REQUIRE(::close(sv[1]) == 0);
     REQUIRE(::close(sv2[1]) == 0);
+}
+
+TEST_CASE("epoll services ready descriptors and expired timers alongside immediate completions",
+          "[io][epoll][fair-service]") {
+    // Keep owners alive until after the backend drops all of its registrations.
+    auto close_file = [](FILE* stream) noexcept { std::fclose(stream); };
+    std::unique_ptr<FILE, decltype(close_file)> file(std::tmpfile(), close_file);
+    REQUIRE(file != nullptr);
+    elio::io::fd_guard event_fd(::eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC));
+    REQUIRE(event_fd.get() >= 0);
+    epoll_backend backend;
+    io_request timer{};
+    timer.op = io_op::timeout;
+    timer.length = 0;  // Relative nanoseconds: expire in this poll.
+    REQUIRE(backend.prepare(timer));
+    io_request socket_ready{};
+    socket_ready.op = io_op::poll_read;
+    socket_ready.fd = event_fd.get();
+    REQUIRE(backend.prepare(socket_ready));
+
+    io_request immediate{};
+    SECTION("regular file completion") {
+        immediate.op = io_op::poll_read;
+        immediate.fd = ::fileno(file.get());
+        REQUIRE(backend.prepare(immediate));
+    }
+    SECTION("synchronous close") {
+        elio::io::fd_guard duplicate(::dup(::fileno(file.get())));
+        REQUIRE(duplicate.get() >= 0);
+        immediate.op = io_op::close;
+        immediate.fd = duplicate.get();
+        REQUIRE(backend.prepare(immediate));
+        (void)duplicate.release();  // The pending close now owns the descriptor.
+    }
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 3);
+    REQUIRE_FALSE(backend.has_pending());
 }
 
 TEST_CASE("epoll precompleted ready results are terminal against cancellation",

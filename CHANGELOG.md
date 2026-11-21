@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The epoll fallback continues servicing ready descriptors and expired timers
+  during sustained regular-file I/O or queued closes (#1305).
+
 - Graceful shutdown no longer stops an I/O owner early when a concurrent grow
   is waiting to reuse its retiring worker slot (#1312).
 - Autoscaler scale wrappers now dispatch nested handlers once per resize

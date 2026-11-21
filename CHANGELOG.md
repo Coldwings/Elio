@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- Contending RPC calls now wait for the client's send mutex without polling a
-  timer per waiter. The existing call deadline and cancellation still apply
-  while waiting (#1321).
-
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease
@@ -21,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers service requeued owner tasks in bounded turns. Foreign wakeups,
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
+
+### Changed
+
+- HTTP/2 buffered uploads advance through the owned request body without
+  repeatedly moving unsent bytes between DATA frames (#1304).
+- Contending RPC calls now wait for the client's send mutex without polling a
+  timer per waiter. The existing call deadline and cancellation still apply
+  while waiting (#1321).
 
 ## [0.6.0] - 2026-10-12
 

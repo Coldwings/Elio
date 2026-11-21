@@ -417,6 +417,53 @@ TEST_CASE("file_helpers: read_file handles multi-chunk reads", "[io][file_helper
     unlink(path.c_str());
 }
 
+TEST_CASE("file_helpers: read_file probes a full buffer without speculative growth",
+          "[io][file_helpers][regression]") {
+    char name[] = "/tmp/elio_file_read_boundary_XXXXXX";
+    fd_guard writer(mkstemp(name));
+    REQUIRE(writer.get() >= 0);
+    struct remove_on_exit {
+        const char* path;
+        ~remove_on_exit() { unlink(path); }
+    } cleanup{name};
+    const std::string path(name);
+    const std::string initial(8192, 'i');
+    REQUIRE(write(writer.get(), initial.data(), initial.size()) == static_cast<ssize_t>(initial.size()));
+
+    bool grow = false, fail_first = false, fail_at_end = false;
+    SECTION("stable EOF") {}
+    SECTION("file grows after the size estimate") { grow = true; }
+    SECTION("failed probe preserves previously read bytes") { fail_at_end = true; }
+    SECTION("first read error remains distinguishable from EOF") { fail_first = true; }
+
+    const std::string suffix = "new bytes after the stat snapshot";
+    size_t boundary_request = 0;
+    bool appended = false;
+    const auto done = run_on_scheduler<std::optional<std::string>>([&] {
+        return elio::io::detail::read_file_with(path,
+            [&](int fd, char* dst, size_t count, int64_t offset) {
+                if (offset == static_cast<int64_t>(initial.size())) {
+                    boundary_request = count;
+                    if (grow) {
+                        appended = pwrite(writer.get(), suffix.data(), suffix.size(), offset)
+                            == static_cast<ssize_t>(suffix.size());
+                    }
+                    if (fail_at_end) fd = -1;
+                }
+                return async_read(fail_first ? -1 : fd, dst, count, offset);
+            });
+    });
+    const auto& content = require_scheduler_value(done);
+    if (fail_first) {
+        REQUIRE_FALSE(content.has_value());
+    } else {
+        REQUIRE(boundary_request != 0);
+        REQUIRE(boundary_request <= 4096);
+        REQUIRE(appended == grow);
+        REQUIRE(content == (grow ? initial + suffix : initial));
+    }
+}
+
 TEST_CASE("file_helpers: append_file", "[io][file_helpers]") {
     struct observation {
         bool first_written = false;

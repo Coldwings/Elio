@@ -2,6 +2,7 @@
 
 #include "io_awaitables.hpp"
 #include <elio/coro/task.hpp>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <optional>
@@ -59,12 +60,10 @@ private:
     int fd_;
 };
 
-/// Read a file's content into a string, in chunks.
-/// An engaged result contains the bytes actually read; it is not a
-/// completeness guarantee: a read failure after bytes were accumulated
-/// still returns the partial content. Returns nullopt only when the file
-/// cannot be opened or the first read fails before any bytes are produced.
-inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
+namespace detail {
+
+template<typename Read>
+coro::task<std::optional<std::string>> read_file_with(const std::string& path, Read read) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         co_return std::nullopt;
@@ -81,40 +80,49 @@ inline coro::task<std::optional<std::string>> read_file(const std::string& path)
     }
 
     // Read the file in chunks, handling TOCTOU where file size may change
-    std::string buffer;
-    buffer.reserve(initial_size > 0 ? initial_size : 4096);
+    std::string buffer(initial_size > 0 ? initial_size : 4096, '\0');
 
     size_t total_read = 0;
     while (true) {
-        // Ensure we have space to read
-        size_t capacity = buffer.capacity();
-        if (total_read >= capacity) {
-            // Double the buffer size
-            buffer.resize(capacity * 2);
-        } else {
-            buffer.resize(capacity);
-        }
-
-        // Read a chunk
-        size_t chunk = std::min(buffer.size() - total_read, size_t(1024 * 1024)); // 1MB chunks
-        auto result = co_await async_read(fd,
-            buffer.data() + total_read, chunk,
-            static_cast<int64_t>(total_read));
+        // A full buffer usually means EOF at the stat estimate. Only grow
+        // after reading one more byte; normal chunks go straight to the result.
+        char extra;
+        const bool probe = total_read == buffer.size();
+        const size_t chunk = probe ? 1 : std::min(buffer.size() - total_read,
+                                                  size_t(1024 * 1024));
+        auto result = co_await read(fd, probe ? &extra : buffer.data() + total_read,
+                                    chunk, static_cast<int64_t>(total_read));
 
         if (!result.success() || result.result == 0) {
-            // EOF or error - truncate to actual read size
-            buffer.resize(total_read);
-            buffer.shrink_to_fit();
             if (total_read == 0 && !result.success()) {
                 co_return std::nullopt;
+            }
+            if (total_read < buffer.size()) {
+                buffer.resize(total_read);
+                buffer.shrink_to_fit();
             }
             co_return buffer;
         }
 
+        if (probe) {
+            buffer.push_back(extra);
+            buffer.resize(buffer.capacity());
+        }
         total_read += static_cast<size_t>(result.result);
     }
+}
 
-    co_return buffer;
+} // namespace detail
+
+/// Read a file's content into a string, in chunks.
+/// An engaged result contains the bytes actually read; it is not a
+/// completeness guarantee: a read failure after bytes were accumulated
+/// still returns the partial content. Returns nullopt only when the file
+/// cannot be opened or the first read fails before any bytes are produced.
+inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
+    return detail::read_file_with(path, [](int fd, char* dst, size_t n, int64_t offset) {
+        return async_read(fd, dst, n, offset);
+    });
 }
 
 /// Write entire content to file (creates/truncates)

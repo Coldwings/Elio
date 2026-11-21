@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated-scope returns, generator consumers, and blocking/timer/group
   completion paths honor the retained owner (#1301).
 
+### Changed
+
+- `io::read_file()` checks for EOF before growing a full output string, avoiding
+  large temporary allocations on stable files while still reading growth (#1314).
+
 ## [0.6.0] - 2026-10-12
 
 This is the first formal 0.6 release. It includes intentional API and

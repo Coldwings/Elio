@@ -16,6 +16,7 @@
 #include <coroutine>
 #include <cstdio>
 #include <exception>
+#include <future>
 #include <fcntl.h>
 #include <memory>
 #include <latch>
@@ -26,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <unistd.h>
 #include <vector>
@@ -2551,8 +2553,7 @@ struct direct_phase_diagnostics {
     bool server_request_received = false;
 };
 
-void capture_direct_phases(void* context) noexcept {
-    auto& phases = *static_cast<direct_phase_diagnostics*>(context);
+void capture_direct_phases(direct_phase_diagnostics& phases) noexcept {
     auto* observed = direct_output_observed.load(std::memory_order_acquire);
     if (!observed) return;
     phases.captured = true;
@@ -2676,10 +2677,9 @@ task<elio::coro::cancel_result> fail_completed_setup_watchdog(
     co_return elio::coro::cancel_result::completed;
 }
 
-void recover_completed_setup_watchdog(void* context) noexcept {
+void recover_completed_setup_watchdog(completed_setup_watchdog_observation& observed) noexcept {
     try {
-        static_cast<completed_setup_watchdog_observation*>(context)->
-            watchdog_recovery.cancel();
+        observed.watchdog_recovery.cancel();
     } catch (...) {}
 }
 
@@ -2811,13 +2811,17 @@ void finish_fixture_output(output_observation& output, elio::coro::cancel_source
     }
 }
 
-template<typename T>
+struct no_fixture_observer {
+    void operator()() const noexcept {}
+};
+
+template<typename T, typename Observer = no_fixture_observer>
+    requires std::is_nothrow_invocable_v<Observer&>
 task<bool> await_fixture_ready(elio::coro::join_handle<T>& joined,
         output_observation& output, elio::coro::cancel_source& stop,
         std::exception_ptr& failure,
         std::chrono::milliseconds budget = std::chrono::seconds(10),
-        void* recovery_context = nullptr,
-        void (*before_recovery)(void*) noexcept = nullptr) {
+        Observer before_recovery = {}) {
     // Bound diagnostic waits as well as public I/O. An early operational error
     // may never reach the retained-output hook; cancellation still joins every
     // frame, and releasing the hook also unblocks terminal output settlement.
@@ -2826,37 +2830,38 @@ task<bool> await_fixture_ready(elio::coro::join_handle<T>& joined,
             std::chrono::steady_clock::now() + budget);
         if (outcome == elio::coro::join_wait_outcome::completed) co_return true;
     } catch (...) { if (!failure) failure = std::current_exception(); }
-    if (before_recovery) before_recovery(recovery_context);
+    before_recovery();
     finish_fixture_output(output, stop, failure, true);
     co_return false;
 }
 
-template<typename T>
+template<typename T, typename Observer = no_fixture_observer>
+    requires std::is_nothrow_invocable_v<Observer&>
 task<T> await_fixture_result(elio::coro::join_handle<T>& joined,
         output_observation& output, elio::coro::cancel_source& stop,
-        std::exception_ptr& failure, void* recovery_context = nullptr,
-        void (*before_recovery)(void*) noexcept = nullptr) {
+        std::exception_ptr& failure, Observer before_recovery = {}) {
     std::optional<T> result;
     try { result.emplace(co_await joined); }
     catch (...) {
         if (!failure) failure = std::current_exception();
-        if (before_recovery) before_recovery(recovery_context);
+        before_recovery();
         finish_fixture_output(output, stop, failure, true);
     }
     try { co_await joined.wait_destroyed_async(); }
     catch (...) {
         if (!failure) failure = std::current_exception();
-        if (before_recovery) before_recovery(recovery_context);
+        before_recovery();
         finish_fixture_output(output, stop, failure, true);
     }
     // The caller rethrows the preserved exception only after all siblings join.
     co_return result ? std::move(*result) : T{};
 }
 
+template<typename Observer = no_fixture_observer>
+    requires std::is_nothrow_invocable_v<Observer&>
 task<bool> await_fixture_phase(elio::sync::event& phase,
         output_observation& output, elio::coro::cancel_source& stop,
-        std::exception_ptr& failure, void* recovery_context = nullptr,
-        void (*before_recovery)(void*) noexcept = nullptr) {
+        std::exception_ptr& failure, Observer before_recovery = {}) {
     auto* scheduler = elio::runtime::scheduler::current();
     std::optional<elio::coro::join_handle<elio::coro::cancel_result>> waiting;
     try {
@@ -2865,7 +2870,7 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
         }));
     } catch (...) {
         if (!failure) failure = std::current_exception();
-        if (before_recovery) before_recovery(recovery_context);
+        before_recovery();
         finish_fixture_output(output, stop, failure, true);
         co_return false;
     }
@@ -2873,18 +2878,18 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
     auto result = elio::coro::cancel_result::cancelled;
     try {
         reached = co_await await_fixture_ready(*waiting, output, stop, failure,
-            std::chrono::seconds(10), recovery_context, before_recovery);
+            std::chrono::seconds(10), before_recovery);
         result = co_await await_fixture_result(*waiting, output, stop, failure,
-            recovery_context, before_recovery);
+            before_recovery);
     } catch (...) {
         if (!failure) failure = std::current_exception();
-        if (before_recovery) before_recovery(recovery_context);
+        before_recovery();
         finish_fixture_output(output, stop, failure, true);
     }
     try { co_await waiting->wait_destroyed_async(); }
     catch (...) {
         if (!failure) failure = std::current_exception();
-        if (before_recovery) before_recovery(recovery_context);
+        before_recovery();
         finish_fixture_output(output, stop, failure, true);
     }
     co_return reached && result == elio::coro::cancel_result::completed;
@@ -2892,7 +2897,8 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
 
 task<void> serve_direct_output(elio::net::tcp_listener& listener,
         elio::tls::tls_context& context, direct_output_observation& observed,
-        elio::coro::cancel_token token, elio::sync::event* handshake_permit = nullptr) {
+        elio::coro::cancel_token token, elio::sync::event* handshake_permit = nullptr,
+        std::promise<void>* accepted_signal = nullptr) {
     observed.server_accept_entered.store(true, std::memory_order_release);
     size_t empty_connections = 0;
     auto accepted = co_await accept_fixture_payload(
@@ -2901,9 +2907,12 @@ task<void> serve_direct_output(elio::net::tcp_listener& listener,
         empty_connections, std::memory_order_release);
     if (!accepted) co_return;
     observed.server_accepted.store(true, std::memory_order_release);
-    if (handshake_permit &&
-        co_await handshake_permit->wait(token) != elio::coro::cancel_result::completed)
-        co_return;
+    if (accepted_signal) accepted_signal->set_value();
+    if (handshake_permit) {
+        if (co_await handshake_permit->wait(token) != elio::coro::cancel_result::completed) {
+            co_return;
+        }
+    }
     elio::tls::tls_stream stream(std::move(*accepted), context);
     observed.server_handshake_entered.store(true, std::memory_order_release);
     const bool handshake_ok = co_await stream.handshake(token);
@@ -2966,9 +2975,6 @@ struct fixture_frame_probe {
     ~fixture_frame_probe() { destroyed = true; }
 };
 
-void count_fixture_recovery(void* context) noexcept {
-    ++*static_cast<size_t*>(context);
-}
 } // namespace
 
 TEST_CASE("Retirement fixtures release and join held frames before reporting exceptions",
@@ -2997,7 +3003,7 @@ TEST_CASE("Retirement fixtures release and join held frames before reporting exc
         });
         if (observer_failure) {
             (void)co_await await_fixture_phase(missing_phase, output, stop, failure,
-                &recovery_calls, count_fixture_recovery);
+                [&]() noexcept { ++recovery_calls; });
         } else {
             auto throwing = scheduler.go_joinable([&]() -> task<int> {
                 fixture_frame_probe frame{throwing_destroyed};
@@ -3005,7 +3011,7 @@ TEST_CASE("Retirement fixtures release and join held frames before reporting exc
                 co_return 0;
             });
             (void)co_await await_fixture_result(throwing, output, stop, failure,
-                &recovery_calls, count_fixture_recovery);
+                [&]() noexcept { ++recovery_calls; });
         }
         cancelled = stop.is_cancelled();
         co_await held;
@@ -3088,7 +3094,7 @@ TEST_CASE("Direct HTTPS Transport retains root accounting through late owned out
             call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
             snapshot.pause_reached = co_await await_fixture_phase(
                 observed.output.paused, observed.output, call_stop, snapshot.failure,
-                &snapshot.phases, capture_direct_phases);
+                [&]() noexcept { capture_direct_phases(snapshot.phases); });
             snapshot.request_completed = co_await await_fixture_ready(
                 *call, observed.output, call_stop, snapshot.failure);
             result = co_await await_fixture_result(*call, observed.output, call_stop, snapshot.failure);
@@ -3109,7 +3115,7 @@ TEST_CASE("Direct HTTPS Transport retains root accounting through late owned out
             if (!snapshot.failure) snapshot.failure = std::current_exception();
             finish_fixture_output(observed.output, call_stop, snapshot.failure, true);
         }
-        if (!snapshot.phases.captured) capture_direct_phases(&snapshot.phases);
+        if (!snapshot.phases.captured) capture_direct_phases(snapshot.phases);
         if (call) co_await call->wait_destroyed_async();
         if (shutdown) co_await shutdown->wait_destroyed_async();
         snapshot.fd_closed = ::fcntl(observed.fd, F_GETFD) == -1;
@@ -3300,17 +3306,16 @@ TEST_CASE("Completed setup watchdog fixture recovers after an early direct TLS f
                 agent.get_result(target, fixture_stop.get_token())));
             snapshot.handshake_failed = co_await await_fixture_phase(
                 observed.direct.handshake_failed, observed.direct.output,
-                fixture_stop, snapshot.failure, &observed,
-                recover_completed_setup_watchdog);
+                fixture_stop, snapshot.failure, [&]() noexcept { recover_completed_setup_watchdog(observed); });
             snapshot.request_ready_before_recovery = call->is_ready();
-            recover_completed_setup_watchdog(&observed);
+            recover_completed_setup_watchdog(observed);
             snapshot.recovery_sent = true;
             result = co_await await_fixture_result(
                 *call, observed.direct.output, fixture_stop, snapshot.failure);
             snapshot.shutdown_result = co_await owner->shutdown();
         } catch (...) {
             if (!snapshot.failure) snapshot.failure = std::current_exception();
-            recover_completed_setup_watchdog(&observed);
+            recover_completed_setup_watchdog(observed);
             finish_fixture_output(
                 observed.direct.output, fixture_stop, snapshot.failure, true);
         }
@@ -3404,18 +3409,15 @@ TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
                 agent.get_result(target, fixture_stop.get_token())));
             snapshot.output_paused = co_await await_fixture_phase(
                 observed.direct.output.paused, observed.direct.output,
-                fixture_stop, snapshot.failure, &observed,
-                recover_completed_setup_watchdog);
+                fixture_stop, snapshot.failure, [&]() noexcept { recover_completed_setup_watchdog(observed); });
             snapshot.watchdog_failed = snapshot.output_paused &&
                 co_await await_fixture_phase(
                     observed.watchdog_failed, observed.direct.output,
-                    fixture_stop, snapshot.failure, &observed,
-                    recover_completed_setup_watchdog);
+                    fixture_stop, snapshot.failure, [&]() noexcept { recover_completed_setup_watchdog(observed); });
             snapshot.cleanup_entered = snapshot.watchdog_failed &&
                 co_await await_fixture_phase(
                     observed.cleanup_entered, observed.direct.output,
-                    fixture_stop, snapshot.failure, &observed,
-                    recover_completed_setup_watchdog);
+                    fixture_stop, snapshot.failure, [&]() noexcept { recover_completed_setup_watchdog(observed); });
             snapshot.operations = owner->active_operations_for_test();
             snapshot.live = owner->admission_counters_for_test().live;
             snapshot.fd_open = ::fcntl(observed.direct.fd, F_GETFD) >= 0;
@@ -3446,7 +3448,7 @@ TEST_CASE("Failed setup watchdog settles an already-connected direct TLS root",
                 *shutdown, observed.direct.output, fixture_stop, snapshot.failure);
         } catch (...) {
             if (!snapshot.failure) snapshot.failure = std::current_exception();
-            recover_completed_setup_watchdog(&observed);
+            recover_completed_setup_watchdog(observed);
             finish_fixture_output(
                 observed.direct.output, fixture_stop, snapshot.failure, true);
         }
@@ -3496,20 +3498,28 @@ TEST_CASE("Direct TLS fixture can cancel an accepted peer before its handshake",
     direct_output_observation observed;
     elio::tls::tls_context context(elio::tls::tls_mode::server);
     elio::sync::event permit;
+    std::promise<void> accepted_signal, destroyed_signal;
+    auto accepted_future = accepted_signal.get_future();
+    auto destroyed_future = destroyed_signal.get_future();
     elio::coro::cancel_source stop;
     elio::runtime::scheduler scheduler(1);
     scheduler.start();
     auto server = scheduler.go_joinable(serve_direct_output(
-        *listener, context, observed, stop.get_token(), &permit));
-    const bool accepted = observe_route_ready([&] {
-        return observed.server_accepted.load(std::memory_order_acquire);
+        *listener, context, observed, stop.get_token(), &permit, &accepted_signal));
+    auto observer = scheduler.go_joinable([&]() -> task<void> {
+        co_await server.wait_destroyed_async();
+        destroyed_signal.set_value();
     });
+    const auto limit = std::chrono::seconds(10);
+    const bool accepted = accepted_future.wait_for(limit) == std::future_status::ready;
     stop.cancel();
-    const bool finished_without_opening_gate = observe_route_ready([&] { return server.is_ready(); });
+    const bool finished_without_opening_gate = destroyed_future.wait_for(limit) == std::future_status::ready;
     permit.set();  // Allow cleanup even if the cancellation assertion would fail.
     ::shutdown(peer.fd, SHUT_RDWR);
+    observer.wait_destroyed();
     server.wait_destroyed();
     REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    observer.await_resume();
     server.await_resume();
     CHECK(accepted);
     CHECK(finished_without_opening_gate);
@@ -3589,7 +3599,7 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
         const char* phase = "submit";
         auto capture = [&]() noexcept {
             if (snapshot.first.captured) return;
-            capture_direct_phases(&snapshot.first);
+            capture_direct_phases(snapshot.first);
             snapshot.phase_before_recovery = phase;
             snapshot.dns_before_recovery = observed.dns_calls.load(std::memory_order_acquire);
             snapshot.dials_before_recovery = observed.dials.load(std::memory_order_acquire);
@@ -3599,11 +3609,10 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
             snapshot.second_accepted_before_recovery =
                 second_observed.server_accepted.load(std::memory_order_acquire);
         };
-        auto before_recovery = [](void* ctx) noexcept { (*static_cast<decltype(capture)*>(ctx))(); };
         auto await_phase = [&](elio::sync::event& event, const char* name) -> task<bool> {
             phase = name;
             co_return co_await await_fixture_phase(event, observed.first.output, call_stop,
-                                                  snapshot.failure, &capture, before_recovery);
+                                                  snapshot.failure, capture);
         };
         try {
             call.emplace(scheduler.go_joinable(agent.get_result(target, call_stop.get_token())));
@@ -3623,9 +3632,9 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
             phase = "request completion";
             snapshot.request_completed_after_second_dial = co_await await_fixture_ready(
                 *call, observed.first.output, call_stop, snapshot.failure, std::chrono::seconds(10),
-                &capture, before_recovery);
+                capture);
             result = co_await await_fixture_result(
-                *call, observed.first.output, call_stop, snapshot.failure, &capture, before_recovery);
+                *call, observed.first.output, call_stop, snapshot.failure, capture);
             snapshot.shutdown_result = co_await owner->shutdown();
         } catch (...) {
             capture();

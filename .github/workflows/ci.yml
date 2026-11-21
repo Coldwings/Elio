@@ -175,12 +175,14 @@ jobs:
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
       shell: bash
       run: |
-        set -o pipefail
+        set -euo pipefail
         # Keep the 600s per-process watchdog and all individual test timeouts.
         core_seed=$(date +%s)
-        for shard in 0 1; do
+        shard_count=2
+        echo "TSAN core: $shard_count shards; Catch2 RNG seed $core_seed"
+        for ((shard=0; shard<shard_count; ++shard)); do
           ./build/tests/elio_tests_tsan '~[http_client_streaming]' \
-            --shard-count 2 --shard-index "$shard" --order decl --rng-seed "$core_seed" \
+            --shard-count "$shard_count" --shard-index "$shard" --order decl --rng-seed "$core_seed" \
             --reporter compact --durations yes --abort 2>&1 \
             | tee "test-logs/catch-tsan-core-$shard.log"
         done

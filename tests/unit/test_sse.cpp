@@ -291,6 +291,18 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         // Retry should be updated
         REQUIRE(parser.retry_ms() == 5000);
     }
+
+    SECTION("advertised retry distinguishes the default from a server field") {
+        event_parser parser;
+        REQUIRE_FALSE(parser.advertised_retry_ms().has_value());
+        REQUIRE(parser.retry_ms() == 3000);
+        parser.parse("retry: 0\n\n");
+        REQUIRE(parser.advertised_retry_ms() == 0);
+        parser.parse("retry: 3000\n\n");
+        parser.reset();
+        parser.parse("retry: invalid\n\n");
+        REQUIRE(parser.advertised_retry_ms() == 3000);
+    }
     
     SECTION("parse multiline data") {
         event_parser parser;

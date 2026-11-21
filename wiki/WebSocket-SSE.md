@@ -326,7 +326,9 @@ remains independently effective.
 For an SSE reconnect, the last positive server `retry:` value overrides
 `default_retry_ms`. With no server retry value, or after `retry: 0`, the
 client uses the current `default_retry_ms` (3000 ms by default). A nonpositive
-configured default requests no delay.
+configured default requests no delay. When using `sse::event_parser` directly,
+`advertised_retry_ms()` returns `std::nullopt` until a valid server field
+arrives; `retry_ms()` retains its standalone 3000 ms fallback.
 
 ### SSE Event Format
 

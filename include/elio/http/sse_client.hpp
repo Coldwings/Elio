@@ -154,6 +154,9 @@ public:
     
     /// Get the server retry interval, or the standalone parser's 3 s default.
     int retry_ms() const { return advertised_retry_ms_.value_or(3000); }
+
+    /// Last valid server retry field; an explicit zero is distinct from no field.
+    std::optional<int> advertised_retry_ms() const noexcept { return advertised_retry_ms_; }
     
     /// Reset parser state
     void reset() {
@@ -168,8 +171,6 @@ public:
     }
     
 private:
-    friend class sse_client;
-
     size_t process_buffer(bool terminal_cr_at_input_end) {
         size_t events_found = 0;
 
@@ -734,7 +735,7 @@ private:
         // exponential backoff survives across reconnection cycles (flapping).
         int retry_ms = current_retry_ms_;
         if (retry_ms <= 0) {
-            retry_ms = parser_.advertised_retry_ms_.value_or(0);
+            retry_ms = parser_.advertised_retry_ms().value_or(0);
             if (retry_ms <= 0) {
                 retry_ms = std::max(0, config_.default_retry_ms);
             }

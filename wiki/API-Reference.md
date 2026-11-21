@@ -1106,8 +1106,10 @@ pending backend work and active operation pins reach zero. `active_tasks()` and
 `pending_tasks()` include that draining work even though its owner is outside
 the logical worker range. A later grow that reuses the slot waits for the old
 worker to finish draining and can therefore wait as long as the outstanding
-I/O. Operations that must not delay reclamation need their own deadline or
-cancellation path. A finite `shutdown()` budget and `shutdown_force()` can
+I/O. If shutdown begins during that wait, it cancels the remaining growth:
+slots already activated stay visible, while the retiring owner keeps polling
+during graceful drain. Operations that must not delay reclamation need their
+own deadline or cancellation path. A finite `shutdown()` budget and `shutdown_force()` can
 interrupt the drain only by entering non-graceful teardown, which may orphan
 in-flight I/O.
 

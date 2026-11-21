@@ -49,12 +49,13 @@ def start_observer(pid):
 def run(command):
     note(f"build={os.environ.get('GITHUB_SHA', 'unknown')} arch={os.uname().machine}"
          f" config={os.environ.get('ELIO_CI_BUILD_TYPE', 'unknown')}")
+    # Apply to both the test and the observer (a debugger can itself fail).
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parent, child = socket.socketpair()
     pid = os.fork()
     if pid == 0:
         parent.close()
         try:
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             # On a Yama-restricted runner, nominate our own parent and its children
             # (the observer). Never change system policy or grant an arbitrary tracer.
             prctl = ctypes.CDLL(None).prctl

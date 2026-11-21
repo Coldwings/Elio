@@ -283,6 +283,18 @@ cmake --build . --target elio_tests_tsan
 
 ### Preserving intermittent sanitizer or assertion evidence
 
+On Linux CI, the ordinary (non-sanitized) unit-test process runs once under
+GDB when the runner permits child tracing. Look for `[native-ci]` in the
+failure artifact's `catch-normal.log`: it records the tested build, the
+exit status, and a snapshot when a watchdog or fatal signal is first seen.
+The signalled thread comes first. Snapshots contain instruction addresses,
+available function names and source locations, not arguments, locals or
+process memory. Up to 32 threads and 24 frames per thread are reported for
+each distinct monitored signal. Optimized builds may have incomplete
+symbols. If tracing is unavailable the log says so and the test runs
+directly; a failed test is not retried. Sanitizer jobs keep their usual
+reports without a debugger. A Catch source line alone is not a fault PC.
+
 When chasing an intermittent full-suite failure, run the test binary through
 `tools/capture-test-evidence.py` before rerunning. The wrapper preserves the
 complete combined output, the command, the current Git HEAD, the explicit

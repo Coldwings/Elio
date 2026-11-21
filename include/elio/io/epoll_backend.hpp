@@ -438,18 +438,18 @@ public:
             }
 
             resume_deferred(deferred_resumes);
-            ELIO_LOG_DEBUG("Processed {} ready completions", completions);
+            deferred_resumes.clear();
+        }
+
+        if (completions > 0 && pending_count() == ready_ops_.size() + pending_sync_ops_) {
+            // No remaining timer or descriptor work to sample.
             return completions;
         }
 
-        if (completions > 0) {
-            // The sync-op drain above already delivered completions; return
-            // them without blocking in epoll_wait (same contract as the
-            // ready-op path). The caller re-polls if it wants to wait.
-            return completions;
-        }
-
-        int timeout_ms = detail::to_epoll_timeout(timeout);
+        // An immediately completed file operation can replenish ready_ops_
+        // on every resume. Sample the other sources in this same turn, but
+        // never sleep after delivering a completion.
+        int timeout_ms = completions > 0 ? 0 : detail::to_epoll_timeout(timeout);
         
         // Adjust timeout based on earliest timer deadline
         if (!timer_queue_.empty()) {
@@ -469,7 +469,7 @@ public:
         
         if (nfds < 0) {
             if (errno == EINTR) {
-                return 0;  // Interrupted, retry
+                return completions;  // Interrupted, retry
             }
             ELIO_LOG_ERROR("epoll_wait failed: {}", strerror(errno));
             return -1;

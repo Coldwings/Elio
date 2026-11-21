@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The epoll fallback continues servicing ready descriptors and expired timers
+  during sustained regular-file I/O or queued closes (#1305).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease

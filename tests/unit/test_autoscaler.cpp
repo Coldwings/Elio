@@ -89,7 +89,7 @@ struct scripted_resize_scheduler {
         finished.store(true, std::memory_order_release);
         return 1;  // Neutral load until the test stops the monitor.
     }
-    size_t num_threads() const { return samples[ticks - 1].workers; }
+    size_t num_threads() const { return samples[ticks == 0 ? 0 : ticks - 1].workers; }
     void set_thread_count(size_t target) {
         attempts.emplace_back(ticks, target);
         if (ticks == 2) throw std::runtime_error("growth failed");
@@ -180,8 +180,8 @@ TEST_CASE("autoscaler start/stop", "[autoscaler]") {
 
 TEST_CASE("autoscaler dispatches handlers inside scale actions",
           "[autoscaler][scale-handlers]") {
-    overload_capture_action::calls.store(0);
-    idle_capture_action::calls.store(0);
+    overload_capture_action::calls.store(0, std::memory_order_relaxed);
+    idle_capture_action::calls.store(0, std::memory_order_relaxed);
     autoscaler_config config;
     config.tick_interval = std::chrono::milliseconds(1);
     config.overload_threshold = 1;
@@ -215,6 +215,7 @@ TEST_CASE("autoscaler reports resize outcomes without retrying within a tick",
     config.min_workers = 2;
     config.max_workers = 3;
     scripted_resize_scheduler sched;
+    CHECK(sched.num_threads() == scripted_resize_scheduler::samples.front().workers);
     auto run = [&](auto& scaler) {
         scaler.start(&sched);
         const bool finished = wait_for_condition([&] {

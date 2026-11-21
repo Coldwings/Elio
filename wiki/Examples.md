@@ -985,7 +985,8 @@ The autoscaler supports:
 For example, `on_overload<scale_up<on_success<log>>>` logs once after the
 overload trigger calls `set_thread_count` and it returns normally, even if
 the scheduler ignored the request (for example, during shutdown). If
-`set_thread_count` throws, `on_failure` runs instead. Handlers inside the
+`set_thread_count` throws, the success action is skipped; an `on_failure`
+handler runs only if one is configured. Handlers inside the
 matching scale wrapper run in declaration order; the wrapper does not
 request a second resize. At the worker limit the trigger does not attempt
 a resize or dispatch any handlers. A normal return does not prove the worker
@@ -993,8 +994,9 @@ count changed.
 
 With or without custom handlers, the monitor logs a resize exception at
 warning level. The trigger that made the request does not retry it. Other
-configured triggers can still act on the same sample. Handlers run on the monitor thread and must
-not let exceptions escape; handler exceptions are not resize failures.
+configured triggers can still act on the same sample. Handlers run on the
+monitor thread and must not let exceptions escape; handler exceptions are
+not resize failures.
 
 The complete `autoscaler_example` retains join handles for every submitted load
 phase and waits for all task frames to be destroyed before releasing captured

@@ -18,6 +18,16 @@ def fixture(mode):
     print("fixture started", flush=True)
     if mode == "failure":
         return 7
+    name, _, handler = mode.partition("-")
+    if name in ("SIGTRAP", "SIGINT"):
+        signum = signal.Signals[name]
+        received = []
+        signal.signal(signum, (lambda sig, frame: received.append(sig)) if handler else signal.SIG_DFL)
+        signal.raise_signal(signum)
+        return 23 if received == [signum] else 0  # A swallowed signal would falsely pass.
+    if mode == "fork-exec":
+        code = subprocess.run([sys.executable, __file__, "--fixture", "failure"]).returncode
+        return 17 if code == 7 else 1
     # More threads than the report cap; none exit before the signal.
     ready = threading.Barrier(35)
 
@@ -60,6 +70,13 @@ def check(probe):
     assert "[native-ci] signal=" not in normal
     failure = run([*self_cmd, "failure"], 7)
     assert failure.count("fixture started") == 1 and "[native-ci] signal=" not in failure
+    forked = run([*self_cmd, "fork-exec"], 17)
+    assert forked.count("fixture started") == 2 and "[native-ci] signal=" not in forked
+    for signum in (signal.SIGTRAP, signal.SIGINT):
+        delivered = run([*self_cmd, signum.name], 128 + signum)
+        assert f"[native-ci] signal={signum.name}" in delivered
+        handled = run([*self_cmd, signum.name + "-handled"], 23)
+        assert f"[native-ci] signal={signum.name}" in handled
     for mode, status in (("wait", 86), ("fallback", 124)):
         timeout = run([probe, mode], status)
         assert "[native-ci] signal=SIGALRM" in timeout and "wall-clock timeout reached" in timeout

@@ -5,6 +5,9 @@ set print thread-events off
 set print frame-arguments none
 set print entry-values no
 handle SIGPIPE SIGUSR1 SIGUSR2 nostop noprint pass
+# GDB normally swallows these two target signals. Its own exec/fork events
+# are not signal-delivery stops and must not be reinjected by the observer.
+handle SIGINT pass
 
 python
 import os
@@ -59,7 +62,7 @@ def record_stacks():
             emit("signalled thread no longer available")
 end
 
-catch signal SIGALRM SIGSEGV SIGABRT SIGBUS SIGILL SIGFPE SIGSYS SIGQUIT
+catch signal SIGALRM SIGSEGV SIGABRT SIGBUS SIGILL SIGFPE SIGSYS SIGQUIT SIGINT
 commands
   silent
   python record_stacks()
@@ -71,6 +74,14 @@ if gdb.selected_inferior().pid != int(os.environ["ELIO_CI_TEST_PID"]):
 ready = int(os.environ["ELIO_CI_GDB_READY"])
 os.write(ready, b"1")
 os.close(ready)
+resume = "continue"
 while gdb.selected_inferior().pid:
-    gdb.execute("continue")
+    gdb.execute(resume)
+    resume = "continue"
+    # An explicit SIGTRAP catchpoint also sees GDB's own loader breakpoints.
+    # Leave GDB's internal trap handling alone; only reinject a signal stop
+    # that ordinary 'continue' actually returned to the command loop.
+    if gdb.selected_inferior().pid and int(gdb.parse_and_eval("$_siginfo.si_signo")) == signal.SIGTRAP:
+        record_stacks()
+        resume = "signal SIGTRAP"
 end

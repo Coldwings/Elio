@@ -441,11 +441,7 @@ public:
             deferred_resumes.clear();
         }
 
-        // Each pending request is counted once: already ready, synchronous,
-        // queued on a timer, or waiting for descriptor readiness. If the
-        // first two account for every request after resuming callers, an
-        // epoll sample cannot deliver any additional completion this turn.
-        if (completions > 0 && pending_count() == ready_ops_.size() + pending_sync_ops_) {
+        if (completions > 0 && !has_pending_timer_or_descriptor()) {
             return completions;
         }
 
@@ -755,6 +751,12 @@ public:
     }
 
 private:
+    bool has_pending_timer_or_descriptor() const noexcept {
+        // On the owner thread each pending request is counted exactly once:
+        // ready, synchronous, waiting on a timer, or waiting on a descriptor.
+        return pending_count() != ready_ops_.size() + pending_sync_ops_;
+    }
+
     struct pending_operation {
         io_request req;
         std::coroutine_handle<> awaiter;

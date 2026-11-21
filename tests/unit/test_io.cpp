@@ -2463,13 +2463,16 @@ TEST_CASE("epoll services ready descriptors and expired timers alongside immedia
     SECTION("regular file completion") {
         immediate.op = io_op::poll_read;
         immediate.fd = ::fileno(file.get());
+        REQUIRE(backend.prepare(immediate));
     }
     SECTION("synchronous close") {
+        elio::io::fd_guard duplicate(::dup(::fileno(file.get())));
+        REQUIRE(duplicate.get() >= 0);
         immediate.op = io_op::close;
-        immediate.fd = ::dup(::fileno(file.get()));
-        REQUIRE(immediate.fd >= 0);
+        immediate.fd = duplicate.get();
+        REQUIRE(backend.prepare(immediate));
+        (void)duplicate.release();  // The pending close now owns the descriptor.
     }
-    REQUIRE(backend.prepare(immediate));
     REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 3);
     REQUIRE_FALSE(backend.has_pending());
 }

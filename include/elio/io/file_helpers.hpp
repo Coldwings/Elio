@@ -84,16 +84,21 @@ coro::task<std::optional<std::string>> read_file_with(const std::string& path, R
     }
 
     // Read the file in chunks, handling TOCTOU where file size may change
-    std::string buffer(initial_size > 0 ? initial_size : 4096, '\0');
+    const size_t initial_window = initial_size > 0 ? initial_size : 4096;
+    constexpr size_t max_chunk = 1024 * 1024;
+    std::string buffer(initial_window, '\0');
 
     size_t total_read = 0;
     while (true) {
+        // After confirmed growth, expose reserved capacity one read at a time.
+        if (total_read == buffer.size() && total_read > initial_window) {
+            buffer.resize(total_read + std::min(buffer.capacity() - total_read, max_chunk));
+        }
         // A full buffer usually means EOF at the stat estimate. Only grow
         // after reading one more byte; normal chunks go straight to the result.
         char extra;
         const bool probe = total_read == buffer.size();
-        const size_t chunk = probe ? 1 : std::min(buffer.size() - total_read,
-                                                  size_t(1024 * 1024));
+        const size_t chunk = probe ? 1 : std::min(buffer.size() - total_read, max_chunk);
         auto result = co_await read(fd, probe ? &extra : buffer.data() + total_read,
                                     chunk, static_cast<int64_t>(total_read));
 
@@ -111,7 +116,6 @@ coro::task<std::optional<std::string>> read_file_with(const std::string& path, R
 
         if (probe) {
             buffer.push_back(extra);
-            buffer.resize(buffer.capacity());
         }
         total_read += static_cast<size_t>(result.result);
     }

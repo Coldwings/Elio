@@ -427,21 +427,22 @@ TEST_CASE("file_helpers: read_file probes a full buffer without speculative grow
         ~remove_on_exit() { unlink(path); }
     } cleanup{name};
     const std::string path(name);
-    const std::string initial(8192, 'i');
-    REQUIRE(write(writer.get(), initial.data(), initial.size()) == static_cast<ssize_t>(initial.size()));
-
-    bool grow = false, fail_first = false, fail_at_end = false;
+    bool grow = false, large_growth = false, fail_first = false, fail_at_end = false;
     SECTION("stable EOF") {}
     SECTION("file grows after the size estimate") { grow = true; }
+    SECTION("growth spans multiple direct reads") { grow = large_growth = true; }
     SECTION("failed probe preserves previously read bytes") { fail_at_end = true; }
     SECTION("first read error remains distinguishable from EOF") { fail_first = true; }
 
-    const std::string suffix = "new bytes after the stat snapshot";
+    const std::string initial(large_growth ? 3 * 1024 * 1024 : 8192, 'i');
+    REQUIRE(write(writer.get(), initial.data(), initial.size()) == static_cast<ssize_t>(initial.size()));
+    const std::string suffix = large_growth ? std::string(2 * 1024 * 1024 + 7, 'g')
+                                            : "new bytes after the stat snapshot";
     size_t boundary_request = 0;
     bool appended = false;
     const auto done = run_on_scheduler<std::optional<std::string>>([&] {
         return elio::io::detail::read_file_with(path,
-            [&](int fd, char* dst, size_t count, int64_t offset) {
+            [&, writer = std::move(writer)](int fd, char* dst, size_t count, int64_t offset) {
                 if (offset == static_cast<int64_t>(initial.size())) {
                     boundary_request = count;
                     if (grow) {

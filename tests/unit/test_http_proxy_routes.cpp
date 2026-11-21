@@ -22,7 +22,6 @@
 #include <mutex>
 #include <optional>
 #include <poll.h>
-#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2891,14 +2890,9 @@ task<bool> await_fixture_phase(elio::sync::event& phase,
     co_return reached && result == elio::coro::cancel_result::completed;
 }
 
-struct direct_peer_handshake_gate {
-    elio::sync::event& permit;
-    std::binary_semaphore arrived{0};
-};
-
 task<void> serve_direct_output(elio::net::tcp_listener& listener,
         elio::tls::tls_context& context, direct_output_observation& observed,
-        elio::coro::cancel_token token, direct_peer_handshake_gate* handshake_gate = nullptr) {
+        elio::coro::cancel_token token, elio::sync::event* handshake_permit = nullptr) {
     observed.server_accept_entered.store(true, std::memory_order_release);
     size_t empty_connections = 0;
     auto accepted = co_await accept_fixture_payload(
@@ -2907,11 +2901,9 @@ task<void> serve_direct_output(elio::net::tcp_listener& listener,
         empty_connections, std::memory_order_release);
     if (!accepted) co_return;
     observed.server_accepted.store(true, std::memory_order_release);
-    if (handshake_gate) {
-        handshake_gate->arrived.release();
-        if (co_await handshake_gate->permit.wait(token) != elio::coro::cancel_result::completed)
-            co_return;
-    }
+    if (handshake_permit &&
+        co_await handshake_permit->wait(token) != elio::coro::cancel_result::completed)
+        co_return;
     elio::tls::tls_stream stream(std::move(*accepted), context);
     observed.server_handshake_entered.store(true, std::memory_order_release);
     const bool handshake_ok = co_await stream.handshake(token);
@@ -3504,15 +3496,16 @@ TEST_CASE("Direct TLS fixture can cancel an accepted peer before its handshake",
     direct_output_observation observed;
     elio::tls::tls_context context(elio::tls::tls_mode::server);
     elio::sync::event permit;
-    direct_peer_handshake_gate gate{permit};
     elio::coro::cancel_source stop;
     elio::runtime::scheduler scheduler(1);
     scheduler.start();
     auto server = scheduler.go_joinable(serve_direct_output(
-        *listener, context, observed, stop.get_token(), &gate));
-    const bool accepted = gate.arrived.try_acquire_for(std::chrono::seconds(10));
+        *listener, context, observed, stop.get_token(), &permit));
+    const bool accepted = observe_route_ready([&] {
+        return observed.server_accepted.load(std::memory_order_acquire);
+    });
     stop.cancel();
-    const bool finished_without_opening_gate = scheduler.wait_for_idle(std::chrono::seconds(10));
+    const bool finished_without_opening_gate = observe_route_ready([&] { return server.is_ready(); });
     permit.set();  // Allow cleanup even if the cancellation assertion would fail.
     ::shutdown(peer.fd, SHUT_RDWR);
     server.wait_destroyed();
@@ -3566,9 +3559,8 @@ TEST_CASE("Direct TLS retry waits for the failed physical root to close",
     scheduler.start();
     // Don't let the mismatched certificate cancel the first pump before it
     // reaches the inactive hook that this test deliberately retains.
-    direct_peer_handshake_gate first_gate{observed.first.output.paused};
     auto first_server = scheduler.go_joinable(serve_direct_output(
-        *first_listener, first_context, observed.first, stop.get_token(), &first_gate));
+        *first_listener, first_context, observed.first, stop.get_token(), &observed.first.output.paused));
     auto second_server = scheduler.go_joinable(serve_direct_output(
         *second_listener, second_context, second_observed, stop.get_token()));
     struct retry_snapshot {

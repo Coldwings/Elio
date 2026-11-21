@@ -457,8 +457,7 @@ TEST_CASE("file_helpers: read_file probes a full buffer without speculative grow
     if (fail_first) {
         REQUIRE_FALSE(content.has_value());
     } else {
-        REQUIRE(boundary_request != 0);
-        REQUIRE(boundary_request <= 4096);
+        REQUIRE(boundary_request == 1);
         REQUIRE(appended == grow);
         REQUIRE(content == (grow ? initial + suffix : initial));
     }

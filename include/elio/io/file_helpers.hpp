@@ -62,6 +62,10 @@ private:
 
 namespace detail {
 
+/// Await read(fd, dst, count, offset) for a positional read. On success, result
+/// is the byte count (0..count, zero at EOF); success() is false on error.
+/// The adapter must not access dst after completion. At a full buffer the
+/// destination is a one-byte probe used to decide whether growth is needed.
 template<typename Read>
 coro::task<std::optional<std::string>> read_file_with(const std::string& path, Read read) {
     int fd = open(path.c_str(), O_RDONLY);
@@ -99,6 +103,7 @@ coro::task<std::optional<std::string>> read_file_with(const std::string& path, R
             }
             if (total_read < buffer.size()) {
                 buffer.resize(total_read);
+                // A stat overestimate or a growth step may leave substantial slack.
                 buffer.shrink_to_fit();
             }
             co_return buffer;

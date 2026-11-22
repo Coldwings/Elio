@@ -14,6 +14,10 @@
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
+- [Worker lifetime leases](wiki/Worker-Leases.md) keep a worker available
+  while thread-affine external resources drain.
+- [Typed RPC](wiki/RPC-Framework.md#receiving-a-field-into-caller-storage)
+  can receive selected response blobs directly into caller-owned buffers.
 - **Autoscaler** for automatic worker thread scaling under load
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable; coroutine-aware waiters use intrusive lifetime cleanup, with token-aware waits available for every suspending primitive in this list
 - **Timers**: sleep_for, sleep_until, yield
@@ -721,8 +725,9 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Approaching Stable | **Version**: 0.6.0 | **Last Release**: [0.6.0](https://github.com/Coldwings/Elio/releases/tag/v0.6.0) (2026-10-12)
+**Status**: Approaching Stable | **Version**: 0.7.0 | **Last Release**: [0.7.0](https://github.com/Coldwings/Elio/releases/tag/v0.7.0) (2026-11-22)
 
-Upgrading from 0.5.x? Review the [0.6 migration guide](wiki/Migrating-to-0.6.md)
-for API and behavior changes, and the [changelog](CHANGELOG.md#060---2026-10-12)
-for the complete release notes and known limitations.
+Upgrading from 0.6.x? Read the [0.7 migration guide](wiki/Migrating-to-0.7.md)
+for the RPC buffer rebuild requirement and RDMA waiter changes. See the
+[changelog](CHANGELOG.md#070---2026-11-22) for the release notes. If upgrading
+from 0.5.x, also review the [0.6 migration guide](wiki/Migrating-to-0.6.md).

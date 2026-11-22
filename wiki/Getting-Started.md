@@ -260,11 +260,12 @@ A few deliberate choices shaped how Elio is built.
 Elio ships as a header-only library. Coroutine-heavy code is inherently
 template-heavy -- the compiler needs to see full definitions to instantiate
 coroutine frames, promise types, and awaitables. A separate compilation model
-would add link-time complexity for very little gain. Header-only also avoids
-Elio-specific ABI compatibility concerns, because there is no compiled Elio
-library. It does not remove normal consumer dependencies: prefer the CMake
-targets, or mirror their include paths, compile definitions, and link libraries
-manually.
+would add link-time complexity for very little gain. There is no compiled Elio
+library to replace, but consumers that exchange Elio objects across a binary
+boundary must agree on their layout. Rebuild both sides after a layout change;
+see [[Migrating to 0.7]] for the RPC buffer types. Use the CMake targets to
+inherit include paths, compile definitions, and link libraries, or provide
+those dependencies explicitly.
 
 ### C++20 coroutines
 

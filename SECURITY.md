@@ -6,6 +6,7 @@ Elio follows semantic versioning. We provide security updates for the following 
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.6.x   | :white_check_mark: |
 | 0.5.x   | :white_check_mark: |
 | 0.4.x   | :white_check_mark: |
 | < 0.4   | :x:                |
@@ -110,4 +111,4 @@ For general security questions (not vulnerability reports):
 
 ---
 
-**Last Updated**: 2026-07-16
+**Last Updated**: 2026-11-22

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <sys/uio.h>
 
 // IOV_MAX fallback for systems that don't define it
@@ -37,8 +38,15 @@
 #include <stdexcept>
 #include <functional>
 #include <type_traits>
+#include <utility>
 
 namespace elio::rpc {
+
+class buffer_view;
+class message_buffer;
+namespace detail {
+buffer_view retained_message_view(std::shared_ptr<const message_buffer> owner) noexcept;
+}
 
 // Import CRC32 functions from hash module for convenience
 using elio::hash::crc32;
@@ -64,12 +72,30 @@ public:
 /// a request or response, the current writer copies referenced bytes into the
 /// outgoing wire buffer.
 /// 
-/// IMPORTANT: The referenced data must remain valid until:
+/// Client response fields decoded by rpc_client::call retain the received
+/// message. A raw span or pointer extracted from a field does not retain it.
+/// For externally supplied send buffers, the data must remain valid until:
 /// - For client: the RPC call completes
 /// - For server: the cleanup callback is invoked
 class buffer_ref {
 public:
     buffer_ref() noexcept = default;
+    buffer_ref(const buffer_ref&) noexcept = default;
+    buffer_ref& operator=(const buffer_ref&) noexcept = default;
+    buffer_ref(buffer_ref&& other) noexcept { *this = std::move(other); }
+    buffer_ref& operator=(buffer_ref&& other) noexcept {
+        if (this != &other) {
+            data_ = other.data_;
+            size_ = other.size_;
+            owner_ = std::move(other.owner_);
+            if (owner_) {
+                // A received field cannot remain a borrowed alias after transfer.
+                other.data_ = nullptr;
+                other.size_ = 0;
+            }
+        }
+        return *this;
+    }
     
     /// Construct from raw pointer and size
     buffer_ref(const void* data, size_t size) noexcept
@@ -87,6 +113,10 @@ public:
     
     /// Get data pointer
     const uint8_t* data() const noexcept { return data_; }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool retains_message_for_test() const noexcept { return bool(owner_); }
+#endif
     
     /// Get size
     size_t size() const noexcept { return size_; }
@@ -108,6 +138,10 @@ public:
     }
     
 private:
+    friend void deserialize_impl(buffer_view&, buffer_ref&);
+    buffer_ref(std::span<const uint8_t> bytes, std::shared_ptr<const message_buffer> owner) noexcept
+        : owner_(std::move(owner)), data_(bytes.data()), size_(bytes.size()) {}
+    std::shared_ptr<const message_buffer> owner_;
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
 };
@@ -127,6 +161,23 @@ inline constexpr bool is_buffer_ref_v = is_buffer_ref<T>::value;
 class buffer_view {
 public:
     buffer_view() noexcept = default;
+    buffer_view(const buffer_view&) noexcept = default;
+    buffer_view& operator=(const buffer_view&) noexcept = default;
+    buffer_view(buffer_view&& other) noexcept { *this = std::move(other); }
+    buffer_view& operator=(buffer_view&& other) noexcept {
+        if (this != &other) {
+            data_ = other.data_;
+            size_ = other.size_;
+            pos_ = other.pos_;
+            owner_ = std::move(other.owner_);
+            if (owner_) {
+                other.data_ = nullptr;
+                other.size_ = 0;
+                other.pos_ = 0;
+            }
+        }
+        return *this;
+    }
     
     buffer_view(const void* data, size_t size) noexcept
         : data_(static_cast<const uint8_t*>(data))
@@ -222,6 +273,7 @@ public:
             throw serialization_error("read_bytes past end of buffer");
         }
         buffer_view result(data_ + pos_, n);
+        result.owner_ = owner_;
         pos_ += n;
         return result;
     }
@@ -271,6 +323,10 @@ public:
     }
     
 private:
+    friend void deserialize_impl(buffer_view&, buffer_ref&);
+    friend buffer_view detail::retained_message_view(
+        std::shared_ptr<const message_buffer>) noexcept;
+    std::shared_ptr<const message_buffer> owner_;
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
     size_t pos_ = 0;
@@ -529,5 +585,14 @@ public:
 private:
     std::vector<uint8_t> data_;
 };
+
+namespace detail {
+inline buffer_view retained_message_view(std::shared_ptr<const message_buffer> owner) noexcept {
+    if (!owner) return {};
+    auto view = owner->view();
+    view.owner_ = std::move(owner);
+    return view;
+}
+} // namespace detail
 
 } // namespace elio::rpc

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The epoll fallback continues servicing ready descriptors and expired timers
+  during sustained regular-file I/O or queued closes (#1305).
+- SSE ignores malformed retry intervals even when their numeric prefix exceeds
+  the parser's 24-hour cap (#1338).
+
 - Graceful shutdown no longer stops an I/O owner early when a concurrent grow
   is waiting to reuse its retiring worker slot (#1312).
 - Autoscaler scale wrappers now dispatch nested handlers once per resize
@@ -28,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- RDMA data-path operations can be directly awaited only from Elio
+  `coro::task<T>` or `coro::generator<T>`. Move direct waits in custom
+  coroutines into an Elio task. External CQ pollers are unchanged (#1348).
+
 - External submissions to a full worker inbox now use its overflow queue
   immediately instead of spinning on the submitting thread (#1322).
 
@@ -39,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `io::read_file()` checks for EOF before growing a full output string, avoiding
   large temporary allocations on stable files while still reading growth (#1314).
+
+### Breaking Changes
+
+- Client response `rpc::buffer_ref` fields now retain their received message
+  when copied or moved out of the result. The wire format is unchanged. Rebuild
+  all components that exchange `rpc::buffer_ref`, `rpc::buffer_view`, or types
+  containing them across a binary boundary; their object layouts changed.
+  They are no longer trivially copyable: use C++ copy or move operations
+  instead of copying their object representation.
 
 ## [0.6.0] - 2026-10-12
 

@@ -22,6 +22,10 @@ writers, and close/destruction racing with active I/O require caller-side
 serialization. Elio does not add locks or queues to reinterpret those races,
 even when the low-level backend can accept multiple requests for the same fd.
 
+The level-triggered epoll fallback stops watching a direction when its last
+waiter completes or is cancelled. A remaining reader can therefore sleep on
+an otherwise writable connection.
+
 ### Separate TCP and UDS Modules
 
 TCP and Unix Domain Sockets live in separate modules (`net/tcp.hpp` and `net/uds.hpp`) because they serve different socket domains with distinct setup and configuration needs. TCP deals with IPv4/IPv6 addressing, DNS resolution, Nagle's algorithm, and keep-alive. UDS, on the other hand, supports filesystem paths, Linux-specific abstract sockets (which have no filesystem entry and are automatically cleaned up), and credential passing via `SO_PASSCRED`. Keeping them separate avoids leaking domain-specific concerns into a shared abstraction.

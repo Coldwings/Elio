@@ -23,6 +23,8 @@
 /// suspended or explicitly started. The op_state ↔ dispatcher race
 /// (see op_state.hpp + completion.hpp) decides which side frees the
 /// node on the final transition.
+/// A data-path wait must belong to an Elio task or generator; delivering
+/// a completion does not require an Elio coroutine or scheduler.
 ///
 /// Multi-SGE lifetime: when an awaiter is constructed from a
 /// `std::span<const sge>`, the underlying SGE array must outlive the
@@ -36,6 +38,7 @@
 #include <elio/rdma/types.hpp>
 
 #include <cassert>
+#include <concepts>
 #include <coroutine>
 #include <cstdint>
 #include <exception>
@@ -44,7 +47,28 @@
 #include <span>
 #include <utility>
 
+namespace elio::coro {
+template<typename T> class task;
+template<typename T> class generator;
+}  // namespace elio::coro
+
 namespace elio::rdma::detail {
+
+// Check both the return-object family and its exact promise. A custom
+// promise inheriting get_return_object() from an Elio promise is not one.
+template<typename Return>
+inline constexpr bool is_waiter_return = false;
+template<typename T>
+inline constexpr bool is_waiter_return<coro::task<T>> = true;
+template<typename T>
+inline constexpr bool is_waiter_return<coro::generator<T>> = true;
+
+template<typename P>
+using waiter_return_t = decltype(std::declval<P&>().get_return_object());
+
+template<typename P>
+concept data_path_waiter = is_waiter_return<waiter_return_t<P>> &&
+    std::same_as<P, typename waiter_return_t<P>::promise_type>;
 
 /// Trait that lets the same awaiter type drive both the static-traits
 /// backend path and the polymorphic_backend path. Primary template uses
@@ -522,7 +546,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -607,7 +632,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -691,7 +717,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -791,7 +818,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -876,7 +904,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -960,7 +989,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;
@@ -1044,7 +1074,8 @@ public:
         return std::move(*this);
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<data_path_waiter Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
         switch (prepare_await_(h)) {
             case await_action::post_needed:
                 break;

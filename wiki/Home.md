@@ -16,7 +16,8 @@
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
-- **RPC Framework**: High-performance RPC with buffer views, checksums, and cleanup callbacks
+- **RPC Framework**: Typed calls with retained response views, caller-owned
+  receive buffers, optional checksums, and cleanup callbacks
 - **Hash Functions**: CRC32, SHA-1, and SHA-256 with incremental hashing support
 - **Header-only**: Use the CMake target to inherit required dependencies
 - **CI/CD**: Automated testing with ASAN and TSAN
@@ -66,8 +67,8 @@ int main() {
 
 Elio is built around a few key technical decisions:
 
-- **Header-only**: No separate build step, no ABI compatibility concerns.
-  Template-heavy coroutine code naturally suits header-only distribution. Link
+- **Header-only**: There is no separately built Elio library. Rebuild both
+  sides of a binary boundary if they exchange types whose layout changes. Link
   the CMake target so consumers inherit required dependencies such as fmt,
   CMake's Threads target, and enabled feature/backend libraries.
 - **Linux-native**: Deep integration with io_uring and signalfd enables optimal performance on modern Linux kernels. epoll provides a fallback for older systems.
@@ -84,6 +85,7 @@ Elio is built around a few key technical decisions:
   responsibilities for audit and triage
 - [[Fork Safety]] - Supported process creation boundaries and inherited-runtime restrictions
 - [[Migrating to 0.6]] - Breaking changes and upgrade checklist for 0.5.x users
+- [[Migrating to 0.7]] - RPC buffer ownership and RDMA waiter changes for 0.6.x users
 - [[Signal Handling]] - Safe signal handling with signalfd
 - [[Networking]] - TCP, HTTP/1.1, and connections
 - [[HTTP Routing]] - Immutable connection identity and reuse compatibility

@@ -7,10 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-22
+
+This release adds worker lifetime leases and field-selective RPC receive
+buffers. See the [migration guide](wiki/Migrating-to-0.7.md) before upgrading
+from 0.6.x, particularly if you exchange RPC types across binary boundaries
+or directly await RDMA operations in a custom coroutine.
+
 ### Fixed
 
 - The epoll fallback continues servicing ready descriptors and expired timers
   during sustained regular-file I/O or queued closes (#1305).
+- Epoll removes interest in a direction after its last waiter finishes or is
+  cancelled, while keeping the opposite direction active (#1313).
+- A blocking pool that cannot start all its workers now stops and joins
+  workers already started before reporting the launch error (#1317).
 - SSE ignores malformed retry intervals even when their numeric prefix exceeds
   the parser's 24-hour cap (#1338).
 
@@ -40,10 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- RDMA data-path operations can be directly awaited only from Elio
-  `coro::task<T>` or `coro::generator<T>`. Move direct waits in custom
-  coroutines into an Elio task. External CQ pollers are unchanged (#1348).
-
 - External submissions to a full worker inbox now use its overflow queue
   immediately instead of spinning on the submitting thread (#1322).
 
@@ -57,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   large temporary allocations on stable files while still reading growth (#1314).
 
 ### Breaking Changes
+
+- RDMA data-path operations can be directly awaited only from Elio
+  `coro::task<T>` or `coro::generator<T>`. Move direct waits in custom
+  coroutines into an Elio task. External CQ pollers are unchanged (#1348).
 
 - Unbound client response `rpc::buffer_ref` fields now retain their received message
   when copied or moved out of the result. The wire format is unchanged. Rebuild

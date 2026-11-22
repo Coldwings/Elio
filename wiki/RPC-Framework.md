@@ -268,7 +268,7 @@ server.register_method_with_cleanup<GetFileData>(
 received payload. When serializing a response or request, the current
 implementation copies the referenced bytes into the outgoing wire buffer.
 
-A `buffer_ref` decoded by `rpc_client::call()` retains its received
+An unbound `buffer_ref` decoded by `rpc_client::call()` retains its received
 message, including when the response or field is copied or moved out of
 `rpc_result`. A pointer, span, `std::string_view`, or `iovec` obtained from the
 field does not retain the bytes: keep an owning field alive while using it. Moving an owning
@@ -279,6 +279,55 @@ borrows the caller's storage; moving a borrowed view does not extend its lifetim
 For externally supplied send buffers, the referenced data must remain valid until:
 - For client: the RPC call completes
 - For server: the cleanup callback is invoked
+
+### Receiving a field into caller storage
+
+For a typed response, bind a top-level `buffer_ref` member to the destination
+of **this call**. Other members are decoded normally. The sender, request,
+frame format, blob length prefix, and optional checksum are unchanged.
+
+```cpp
+std::array<uint8_t, 8192> page;
+auto r = co_await client->call<ReadAt>(req, rpc::into<&ReadReply::data>(page),
+                                       timeout, token);
+if (r.ok()) use(r->generation, r->data.span()); // aliases page; actual length
+```
+
+For scatter input, pass the segments and an output count. For example, a
+5,000-byte blob fills 4,096 bytes of the first page and 904 of the second.
+Unused capacity is neither transferred nor overwritten.
+
+```cpp
+std::array<iovec, 2> pages{{{a.data(), a.size()}, {b.data(), b.size()}}};
+size_t received = 0;
+auto r = co_await client->call<ReadAt>(req, rpc::into<&ReadReply::data>(pages, received));
+if (r.ok()) consume_pages(pages, received, r->generation);
+```
+
+The segment descriptors are copied at binding time. On success, `received`
+is the field's length, and the corresponding `r->data` is empty: a single
+contiguous `buffer_ref` cannot represent disjoint pages. On failure the
+count is not committed. A contiguous bound field instead borrows exactly
+the written prefix and does **not** extend the lifetime of the caller's memory.
+Use `rpc::bind_fields(rpc::into<&Reply::a>(...), rpc::into<&Reply::b>(...))`
+for several distinct fields. Member pointers must designate registered
+top-level `buffer_ref` fields. Preceding metadata must use the standard RPC
+wire codecs (including variable-length fields, nested structs and containers);
+following fields are decoded normally. No full-frame staging buffer or
+post-receive copy is used for the bound blob. This is a receive-side guarantee,
+not a claim about kernel copies or send serialization.
+
+Keep destination bytes and output counts valid and exclusively available
+until the awaited call returns. Do not overlap output ranges or counts.
+Cancellation, timeout, disconnect or checksum failure may leave partial bytes
+in the destinations. An admitted transport read must finish or be woken before
+the call returns: requesting cancellation does not immediately release a page.
+With the connection frame deadline disabled, a stalled admitted read can wait
+for data or connection close. Buffer reuse depends only on the local call
+returning; the wire protocol has no cancellation acknowledgement.
+A blob that exceeds capacity reports `resource_exhausted` without truncation;
+framed local errors drain the remaining bytes, while transport or CRC failure
+closes the connection.
 
 ## Wire Protocol
 

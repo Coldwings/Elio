@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RPC calls can bind individual response blob fields directly to caller-owned
+  contiguous or scatter buffers, without changing the wire protocol (#1350).
+
 - Move-only worker lifetime leases for external thread-affine owners. Lease
   acquisition retains exact-owner continuations and worker drain accounting;
   release safely wakes retirement, including from a foreign thread. Retiring
@@ -55,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- Client response `rpc::buffer_ref` fields now retain their received message
+- Unbound client response `rpc::buffer_ref` fields now retain their received message
   when copied or moved out of the result. The wire format is unchanged. Rebuild
   all components that exchange `rpc::buffer_ref`, `rpc::buffer_view`, or types
   containing them across a binary boundary; their object layouts changed.

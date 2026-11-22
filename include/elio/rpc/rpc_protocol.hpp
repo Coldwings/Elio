@@ -371,16 +371,11 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
     co_return io::io_result{static_cast<int32_t>(total_length), 0};
 }
 
-/// Read a complete frame from the stream, capping the payload at
-/// `max_payload`. The cap is checked BEFORE allocating the receive buffer
-/// (so a peer cannot trick us into a large allocation), and the underlying
-/// connection is closed (caller-side) when the cap is exceeded.
-///
-/// If the frame has the has_checksum flag set, verifies the CRC32 checksum for
-/// non-cryptographic corruption detection.
-template<rpc_stream Stream>
-coro::task<std::optional<std::pair<frame_header, message_buffer>>>
-read_frame_bounded(Stream& stream, uint32_t max_payload) {
+namespace detail {
+using frame_result = std::optional<std::pair<frame_header, message_buffer>>;
+
+template<rpc_stream Stream, typename Route>
+coro::task<frame_result> read_frame_routed(Stream& stream, uint32_t max_payload, Route route) {
     // Read header
     std::array<uint8_t, frame_header_size> header_buf;
     auto result = co_await stream.read_exactly(header_buf.data(), frame_header_size);
@@ -408,6 +403,12 @@ read_frame_bounded(Stream& stream, uint32_t max_payload) {
         ELIO_LOG_ERROR("Frame payload too large: len={} > cap={}",
                        header.payload_length, max_payload);
         co_return std::nullopt;
+    }
+
+    if constexpr (!std::is_same_v<Route, std::nullptr_t>) {
+        if (auto reader = route(header)) {
+            co_return co_await reader->read_body(stream, header, header_buf);
+        }
     }
 
     // Read payload
@@ -443,6 +444,14 @@ read_frame_bounded(Stream& stream, uint32_t max_payload) {
     }
 
     co_return std::make_pair(header, std::move(payload));
+}
+} // namespace detail
+
+/// Read one complete frame, enforcing the configured cap before allocation
+/// and verifying an optional CRC32 trailer before publishing the payload.
+template<rpc_stream Stream>
+coro::task<detail::frame_result> read_frame_bounded(Stream& stream, uint32_t max_payload) {
+    return detail::read_frame_routed(stream, max_payload, nullptr);
 }
 
 /// Read a complete frame using the protocol-wide max payload cap.

@@ -20,6 +20,7 @@
 /// @endcode
 
 #include "rpc_protocol.hpp"
+#include "rpc_into.hpp"
 
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
@@ -74,6 +75,8 @@ struct pending_request {
     message_buffer response_data;
     frame_header response_header;
     rpc_error error = rpc_error::success;
+    std::shared_ptr<detail::bound_receive> receiver;
+    std::atomic<bool> receiver_armed{false};
     operation_kind operation = operation_kind::call;
     std::atomic<bool> completed{false};
     std::atomic<bool> published{false};
@@ -90,6 +93,7 @@ struct pending_request {
 
     /// Publish the completed state after response/error fields are written.
     void publish_completion() noexcept {
+        if (receiver) receiver->gate.seal();
         published.store(true, std::memory_order_release);
         completion_event.set();
     }
@@ -414,6 +418,23 @@ public:
     {
         return call_impl<Method>(request, timeout, std::move(token));
     }
+
+    template<typename Method, detail::bindings B>
+    coro::task<rpc_result<typename Method::response_type>> call(
+        const typename Method::request_type& request, B bindings, coro::cancel_token token = {})
+    {
+        return call<Method>(request, std::move(bindings),
+                            std::chrono::milliseconds(default_timeout_ms), std::move(token));
+    }
+
+    template<typename Method, detail::bindings B, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>> call(
+        const typename Method::request_type& request, B bindings,
+        std::chrono::duration<Rep, Period> timeout, coro::cancel_token token = {})
+    {
+        return call_impl<Method>(request, timeout, std::move(token),
+            detail::make_receive_plan<typename Method::response_type>(std::move(bindings)));
+    }
     
 private:
     /// RAII helper that erases a pending request from its shard map on
@@ -492,7 +513,8 @@ private:
     coro::task<rpc_result<typename Method::response_type>> call_impl(
         const typename Method::request_type& request,
         std::chrono::duration<Rep, Period> timeout,
-        coro::cancel_token token)
+        coro::cancel_token token,
+        std::shared_ptr<detail::typed_receive<typename Method::response_type>> receiver = {})
     {
         using Response = typename Method::response_type;
 
@@ -519,7 +541,7 @@ private:
         // wraps, so skip IDs that are still in-flight instead of overwriting
         // the pending entry for an older call.
         auto reserved = reserve_pending_request(
-            pending_request::operation_kind::call, rpc_error::success);
+            pending_request::operation_kind::call, rpc_error::success, receiver);
         if (!reserved) {
             co_return rpc_result<Response>(rpc_error::internal_error);
         }
@@ -593,12 +615,14 @@ private:
             });
         }
 
-        {
+        std::exception_ptr send_exception;
+        try {
             bool locked = co_await lock_send_mutex_for_call(operation_token);
             if (locked) {
                 sync::lock_guard send_guard(send_mutex_);
 
                 if (!pending->is_completed() && !operation_token.is_cancelled()) {
+                    if (receiver) pending->receiver_armed.store(true, std::memory_order_release);
                     bool sent = co_await write_call_frame(
                         request_frame.first, request_frame.second, operation_token);
                     if (!sent) {
@@ -610,11 +634,17 @@ private:
                     }
                 }
             }
+        } catch (...) {
+            if (!receiver) throw;
+            send_exception = std::current_exception();
+            close();
+            complete_pending_with_error(pending, rpc_error::connection_closed);
         }
 
         // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
         (void)pending->is_published();
+        if (receiver) co_await receiver->gate.wait_quiescent();
 
         // Cancel the watcher and any cancellable local send await once the
         // request has completed, regardless of how completion happened.
@@ -622,6 +652,7 @@ private:
 
         // Unregister cancellation callback
         cancel_registration.unregister();
+        if (send_exception) std::rethrow_exception(send_exception);
 
         if (pending->error == rpc_error::cancelled && request_sent) {
             if (!start_cancel_frame(request_id)) {
@@ -649,6 +680,7 @@ private:
             buffer_view view = detail::retained_message_view(
                 std::shared_ptr<const message_buffer>(pending, &pending->response_data));
             Response response = parse_response<Response>(view);
+            if (receiver) receiver->commit(response);
             co_return rpc_result<Response>(std::move(response));
         } catch (const serialization_error& e) {
             ELIO_LOG_ERROR("Failed to deserialize response: {}", e.what());
@@ -798,16 +830,27 @@ private:
         , config_(config) {}
 
     coro::task<std::optional<std::pair<frame_header, message_buffer>>>
-    read_frame_with_deadline() {
+    read_frame_with_deadline(std::shared_ptr<pending_request>& response) {
+        auto route = [this, &response](const frame_header& h) -> detail::bound_receive* {
+            if (h.type != message_type::response && h.type != message_type::error) return nullptr;
+            auto& shard = pending_shard_for(h.request_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto it = shard.requests.find(h.request_id);
+            if (it == shard.requests.end() ||
+                it->second->operation != pending_request::operation_kind::call ||
+                it->second->is_completed()) return nullptr;
+            if (it->second->receiver && !it->second->receiver_armed.load(std::memory_order_acquire))
+                return nullptr;
+            response = it->second;
+            return h.type == message_type::response ? response->receiver.get() : nullptr;
+        };
         if (config_.frame_read_timeout.count() <= 0) {
-            co_return co_await read_frame_bounded(
-                stream_, config_.max_message_size);
+            co_return co_await detail::read_frame_routed(stream_, config_.max_message_size, route);
         }
 
         auto* sched = runtime::scheduler::current();
         if (!sched) {
-            co_return co_await read_frame_bounded(
-                stream_, config_.max_message_size);
+            co_return co_await detail::read_frame_routed(stream_, config_.max_message_size, route);
         }
 
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
@@ -830,8 +873,7 @@ private:
             ? sched->go_joinable_to(current_worker->worker_id(), watchdog_body)
             : sched->go_joinable(watchdog_body);
 
-        auto frame = co_await read_frame_bounded(
-            stream_, config_.max_message_size);
+        auto frame = co_await detail::read_frame_routed(stream_, config_.max_message_size, route);
 
         watchdog_cancel.cancel();
         co_await std::move(watchdog);
@@ -882,7 +924,8 @@ private:
                 break;
             }
 
-            auto frame = co_await self->read_frame_with_deadline();
+            std::shared_ptr<pending_request> response;
+            auto frame = co_await self->read_frame_with_deadline(response);
             if (!frame) {
                 ELIO_LOG_DEBUG("RPC client receive loop: connection closed");
                 self->close();
@@ -895,7 +938,7 @@ private:
             switch (header.type) {
                 case message_type::response:
                 case message_type::error:
-                    self->handle_response(header, std::move(payload));
+                    self->handle_response(response, header, std::move(payload));
                     break;
 
                 case message_type::pong:
@@ -923,30 +966,19 @@ private:
     }
     
     /// Handle a response message
-    void handle_response(const frame_header& header, message_buffer payload) {
-        std::shared_ptr<pending_request> pending;
-        
-        {
-            auto& shard = pending_shard_for(header.request_id);
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            auto it = shard.requests.find(header.request_id);
-            if (it == shard.requests.end()) {
-                ELIO_LOG_WARNING("RPC client: received response for unknown request {}",
-                                header.request_id);
-                return;
-            }
-            pending = it->second;
-            if (pending->operation != pending_request::operation_kind::call) {
-                ELIO_LOG_WARNING("RPC client: received response for non-call request {}",
-                                header.request_id);
-                return;
-            }
+    void handle_response(const std::shared_ptr<pending_request>& pending,
+                         const frame_header& header, message_buffer payload) {
+        if (!pending) {
+            ELIO_LOG_DEBUG("RPC client: ignoring unmatched response {}", header.request_id);
+            return;
         }
         
         // Use atomic try_complete to ensure only one thread sets the response
         if (pending->try_complete()) {
             pending->response_header = header;
             pending->response_data = std::move(payload);
+            if (pending->receiver && header.type == message_type::response)
+                pending->error = pending->receiver->decode_error;
             pending->publish_completion();
         }
     }
@@ -999,10 +1031,12 @@ private:
     std::optional<reserved_pending_request> reserve_pending_request(
         pending_request::operation_kind operation =
             pending_request::operation_kind::call,
-        rpc_error initial_error = rpc_error::success) {
+        rpc_error initial_error = rpc_error::success,
+        std::shared_ptr<detail::bound_receive> receiver = {}) {
         auto pending = std::make_shared<pending_request>();
         pending->operation = operation;
         pending->error = initial_error;
+        pending->receiver = std::move(receiver);
         std::lock_guard<std::mutex> reservation_lock(request_id_mutex_);
         auto request_id = detail::reserve_unique_request_id(
             [this]() {

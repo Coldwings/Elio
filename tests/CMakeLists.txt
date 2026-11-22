@@ -79,6 +79,7 @@ set(TEST_SOURCES
     unit/test_timer.cpp
     unit/test_hash.cpp
     unit/test_rpc.cpp
+    unit/test_rpc_into.cpp
     unit/test_signalfd.cpp
     unit/test_autoscaler.cpp
     unit/test_generator.cpp

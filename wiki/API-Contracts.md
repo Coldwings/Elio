@@ -489,6 +489,10 @@ Case law (frozen): `sync::semaphore` permit/cancellation handoff — #1078, #109
 
 ## RDMA, RDMA-CM, And CUDA RDMA
 
+Only an Elio `coro::task<T>` or `coro::generator<T>` may directly await an
+RDMA data-path operation (including SRQ receive). This is a compile-time
+requirement on the waiter, not on the thread delivering a completion.
+
 | Interface | Elio guarantees | Caller must guarantee |
 |-----------|-----------------|-----------------------|
 | `rdma::backend_traits` | Defines the backend posting contract and normalizes synchronous post failures into awaiter result paths. | Backend `post_*` methods must be `noexcept`, follow the return convention, and keep QP/CQ/backend objects alive while operations can complete. |

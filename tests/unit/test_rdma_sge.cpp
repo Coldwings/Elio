@@ -7,6 +7,7 @@
 // single-buffer path keeps working unchanged.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -131,26 +132,7 @@ struct sge_poly_backend : polymorphic_backend {
     }
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-    std::coroutine_handle<promise_type> handle;
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() { if (handle) handle.destroy(); }
-};
+using probe_task = elio::coro::task<void>;
 
 template <typename Conn>
 probe_task run_send_span(Conn& c, std::span<const sge> sges,
@@ -209,8 +191,8 @@ TEST_CASE("send: multi-SGE span threads through to the backend verbatim",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send_span(c, std::span<const sge>(sges),
-                              send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send_span(c, std::span<const sge>(sges),
+                              send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.posts.load() == 1);
@@ -249,7 +231,7 @@ TEST_CASE("recv: multi-SGE span threads through to the backend verbatim",
 
     wc_result result{};
     bool done = false;
-    auto task = run_recv_span(c, std::span<const sge>(sges), result, done);
+    auto task = elio::test::start_rdma_task(run_recv_span(c, std::span<const sge>(sges), result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.posts.load() == 1);
@@ -288,7 +270,7 @@ TEST_CASE("recv: started multi-SGE operation does not reread span on await",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.posts.load() == 1);
@@ -323,8 +305,8 @@ TEST_CASE("rdma_write: multi-SGE gather with remote_buffer + flags",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write_span(c, std::span<const sge>(sges),
-                               remote, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_write_span(c, std::span<const sge>(sges),
+                               remote, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.last_sges.size() == 2u);
@@ -358,8 +340,8 @@ TEST_CASE("rdma_read: multi-SGE scatter with remote_buffer",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read_span(c, std::span<const sge>(sges),
-                              remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read_span(c, std::span<const sge>(sges),
+                              remote, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.last_sges.size() == 2u);
@@ -389,7 +371,7 @@ TEST_CASE("send: single-buffer_view overload delivers exactly one SGE",
         result = co_await c.send(local);
         done   = true;
     };
-    auto task = run(bv);
+    auto task = elio::test::start_rdma_task(run(bv));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.last_sges.size() == 1u);
@@ -417,8 +399,8 @@ TEST_CASE("polymorphic send: multi-SGE dispatches through vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send_span(c, std::span<const sge>(sges),
-                              send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send_span(c, std::span<const sge>(sges),
+                              send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.posts.load() == 1);
@@ -447,8 +429,8 @@ TEST_CASE("polymorphic rdma_write: multi-SGE dispatches through vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write_span(c, std::span<const sge>(sges),
-                               remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write_span(c, std::span<const sge>(sges),
+                               remote, send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.last_sges.size() == 2u);
@@ -469,8 +451,8 @@ TEST_CASE("empty SGE span posts a zero-length scatter list",
     std::array<sge, 0> empty{};
     wc_result result{};
     bool done = false;
-    auto task = run_send_span(c, std::span<const sge>(empty),
-                              send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send_span(c, std::span<const sge>(empty),
+                              send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.last_sges.size() == 0u);

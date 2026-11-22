@@ -13,6 +13,7 @@
 //   * Polymorphic backend dispatches identically.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -147,30 +148,7 @@ struct one_sided_poly_backend : polymorphic_backend {
     }
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-
-    std::coroutine_handle<promise_type> handle;
-
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() {
-        if (handle) handle.destroy();
-    }
-};
+using probe_task = elio::coro::task<void>;
 
 template <typename Conn>
 probe_task run_write(Conn& c, buffer_view local, remote_buffer remote,
@@ -229,7 +207,7 @@ TEST_CASE("rdma_write: backend receives local SGE + remote_buffer + flags",
     bool done = false;
     send_flags flags{};
     flags.fence = true;
-    auto task = run_write(c, local, remote, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.writes.load() == 1);
@@ -270,7 +248,7 @@ TEST_CASE("rdma_write: inline successful completion resumes after post returns",
     st.inline_done = &done;
     st.inline_write_success = true;
 
-    auto task = run_write(c, local, remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
 
     REQUIRE(st.writes.load() == 1);
     REQUIRE_FALSE(st.resumed_before_post_return);
@@ -296,7 +274,7 @@ TEST_CASE("rdma_write: awaited operation forces completion for unsignaled flags"
 
     wc_result result{};
     bool done = false;
-    auto task = run_write(c, local, remote, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.writes.load() == 1);
@@ -327,7 +305,7 @@ TEST_CASE("rdma_write: start posts immediately and later await does not repost",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.writes.load() == 1);
@@ -356,7 +334,7 @@ TEST_CASE("rdma_read: completion before awaiting a started op resumes inline",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE(st.reads.load() == 1);
@@ -383,7 +361,7 @@ TEST_CASE("rdma_read: backend receives local SGE + remote_buffer; "
 
     wc_result result{};
     bool done = false;
-    auto task = run_read(c, local, remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.reads.load() == 1);
@@ -415,7 +393,7 @@ TEST_CASE("rdma_write: local bytes exceeding remote length rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write(c, local, remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
 
     REQUIRE(done);
     REQUIRE(st.writes.load() == 0);
@@ -438,7 +416,7 @@ TEST_CASE("rdma_read: local bytes exceeding remote length rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read(c, local, remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
 
     REQUIRE(done);
     REQUIRE(st.reads.load() == 0);
@@ -465,8 +443,8 @@ TEST_CASE("rdma_write: remote length check uses a wide multi-SGE total",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write_sges(c, std::span<const sge>(locals), remote,
-                               send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write_sges(c, std::span<const sge>(locals), remote,
+                               send_flags{}, result, done));
 
     REQUIRE(done);
     REQUIRE(st.writes.load() == 0);
@@ -493,8 +471,8 @@ TEST_CASE("rdma_read: remote length check uses a wide multi-SGE total",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read_sges(c, std::span<const sge>(locals), remote,
-                              result, done);
+    auto task = elio::test::start_rdma_task(run_read_sges(c, std::span<const sge>(locals), remote,
+                              result, done));
 
     REQUIRE(done);
     REQUIRE(st.reads.load() == 0);
@@ -519,7 +497,7 @@ TEST_CASE("rdma_write: oversized single-buffer length is rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write(c, local, remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
 
     REQUIRE(done);
     REQUIRE(st.writes.load() == 0);
@@ -544,7 +522,7 @@ TEST_CASE("rdma_read: oversized single-buffer length is rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read(c, local, remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
 
     REQUIRE(done);
     REQUIRE(st.reads.load() == 0);
@@ -568,7 +546,7 @@ TEST_CASE("rdma_write: post failure resumes inline with flush error",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write(c, local, remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -591,7 +569,7 @@ TEST_CASE("rdma_read: post failure resumes inline with flush error",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read(c, local, remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -615,7 +593,7 @@ TEST_CASE("rdma_write: orphan race — coroutine destroyed before CQE",
     {
         wc_result result{};
         bool done = false;
-        auto task = run_write(c, local, remote, send_flags{}, result, done);
+        auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
         REQUIRE_FALSE(done);
         captured = st.last_write_id;
         REQUIRE(captured != 0);
@@ -640,7 +618,7 @@ TEST_CASE("rdma_read: orphan race — coroutine destroyed before CQE",
     {
         wc_result result{};
         bool done = false;
-        auto task = run_read(c, local, remote, result, done);
+        auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
         REQUIRE_FALSE(done);
         captured = st.last_read_id;
     }
@@ -665,7 +643,7 @@ TEST_CASE("rdma_write via polymorphic_backend dispatches through the vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_write(c, local, remote, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_write(c, local, remote, send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.writes.load() == 1);
@@ -696,7 +674,7 @@ TEST_CASE("rdma_read via polymorphic_backend dispatches through the vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_read(c, local, remote, result, done);
+    auto task = elio::test::start_rdma_task(run_read(c, local, remote, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.reads.load() == 1);

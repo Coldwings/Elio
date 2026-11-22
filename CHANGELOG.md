@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- RDMA data-path operations can be directly awaited only from Elio
+  `coro::task<T>` or `coro::generator<T>`. Move direct waits in custom
+  coroutines into an Elio task. External CQ pollers are unchanged (#1348).
+
 - External submissions to a full worker inbox now use its overflow queue
   immediately instead of spinning on the submitting thread (#1322).
 

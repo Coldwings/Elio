@@ -2,6 +2,7 @@
 #include <elio/rpc/rpc_client.hpp>
 
 #include <deque>
+#include <functional>
 #include <future>
 
 namespace {
@@ -74,6 +75,7 @@ struct peer {
     bool invalid_suffix = false;
     bool fail_send = false;
     bool throw_read = false;
+    std::function<void()> on_shutdown;
     std::vector<uint32_t> requests;
 
     void respond(uint32_t id) {
@@ -108,7 +110,11 @@ struct peer {
 struct stream {
     std::shared_ptr<peer> p;
     bool is_valid() const { return p->valid; }
-    void shutdown_socket() { p->valid = false; p->readable.set(); }
+    void shutdown_socket() {
+        p->valid = false;
+        if (p->on_shutdown) p->on_shutdown();
+        p->readable.set();
+    }
     coro::task<io::io_result> read_exactly(void* to, size_t n) {
         if (p->throw_read && !p->requests.empty()) throw std::runtime_error("fixture read failure");
         if (p->pause_at == to) {
@@ -434,6 +440,20 @@ TEST_CASE("RPC throwing frame read closes pending calls and releases the watchdo
     CHECK(error == rpc_error::connection_closed);
     CHECK_FALSE(p->valid);
     CHECK(weak.expired());
+}
+
+TEST_CASE("RPC close retains an owner during off-scheduler shutdown callbacks", "[rpc][into]") {
+    auto p = std::make_shared<peer>();
+    auto c = client::create(stream{p});
+    std::weak_ptr<client> observer = c;
+    bool protected_owner = false;
+    p->on_shutdown = [&] { protected_owner = observer.use_count() > 1; };
+    // Keep the external owner throughout; inspect the independent guard
+    // without destroying an object from inside any callback.
+    REQUIRE(observer.use_count() == 1);
+    c->close();
+    CHECK(protected_owner);
+    CHECK(observer.use_count() == 1);
 }
 
 TEST_CASE("RPC cancellation on a different Elio worker seals a real destination read", "[rpc][into]") {

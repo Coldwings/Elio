@@ -332,6 +332,9 @@ public:
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return;  // Already closed
         }
+        // A shutdown or inline notification can release external owners.
+        // weak_from_this also permits close() from the destructor.
+        [[maybe_unused]] auto keep_alive = this->weak_from_this().lock();
 
         // Shut down the underlying socket to force the receive loop's
         // blocked read to return.  Without this, the receive loop stays
@@ -344,14 +347,15 @@ public:
         // event::set() may resume a waiter inline when close() is called
         // outside a scheduler; that waiter destroys pending_eraser, which
         // re-enters the same shard mutex.
-        for (auto& shard : pending_shards_) {
-            decltype(shard.requests) detached;
-            {
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                detached.swap(shard.requests);
-                pending_request_count_.fetch_sub(detached.size(), std::memory_order_acq_rel);
-            }
-            for (auto& [id, req] : detached) {
+        std::array<decltype(pending_shards_[0].requests), pending_shard_count> detached;
+        for (size_t i = 0; i < pending_shard_count; ++i) {
+            auto& shard = pending_shards_[i];
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            detached[i].swap(shard.requests);
+            pending_request_count_.fetch_sub(detached[i].size(), std::memory_order_acq_rel);
+        }
+        for (auto& entries : detached) {
+            for (auto& [id, req] : entries) {
                 (void)id;
                 if (req->try_complete()) {
                     req->error = rpc_error::connection_closed;

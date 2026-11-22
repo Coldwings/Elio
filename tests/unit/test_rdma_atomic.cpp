@@ -20,6 +20,7 @@
 //   * Raw vs host accessor distinction.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -202,26 +203,7 @@ struct atomic_poly_no_override : polymorphic_backend {
                        remote_buffer, wr_id) noexcept override { return 0; }
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-    std::coroutine_handle<promise_type> handle;
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() { if (handle) handle.destroy(); }
-};
+using probe_task = elio::coro::task<void>;
 
 template <typename Awaiter>
 probe_task run_started_atomic(Awaiter op, atomic_result& out, bool& done) {
@@ -259,7 +241,7 @@ TEST_CASE("cas: backend receives args verbatim; old value round-trips",
         result = co_await c.cas(bv, remote, /*compare=*/42, /*swap=*/100);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.cas_calls.load() == 1);
@@ -301,7 +283,7 @@ TEST_CASE("cas: start posts immediately and can complete before await",
 
     atomic_result result{};
     bool done = false;
-    auto task = run_started_atomic(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started_atomic(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE(st.cas_calls.load() == 1);
@@ -329,7 +311,7 @@ TEST_CASE("cas: oversized local buffer length is rejected pre-post",
         result = co_await c.cas(bv, remote, 1, 2);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE(done);
     REQUIRE(st.cas_calls.load() == 0);
@@ -359,7 +341,7 @@ TEST_CASE("cas: awaited operation forces completion for unsignaled flags",
         result = co_await c.cas(bv, remote, 1, 2, flags);
         done = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.cas_calls.load() == 1);
@@ -390,7 +372,7 @@ TEST_CASE("fetch_add: backend receives add operand; old value round-trips",
         result = co_await c.fetch_add(bv, remote, /*add=*/7);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.faa_calls.load() == 1);
@@ -420,7 +402,7 @@ TEST_CASE("fetch_add: short local buffer length is rejected pre-post",
         result = co_await c.fetch_add(bv, remote, 7);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE(done);
     REQUIRE(st.faa_calls.load() == 0);
@@ -448,7 +430,7 @@ TEST_CASE("fetch_add: started oversized local buffer length is returned on await
 
     atomic_result result{};
     bool done = false;
-    auto task = run_started_atomic(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started_atomic(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -477,7 +459,7 @@ TEST_CASE("fetch_add: awaited operation forces completion for unsignaled flags",
         result = co_await c.fetch_add(bv, remote, 7, flags);
         done = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.faa_calls.load() == 1);
@@ -508,7 +490,7 @@ TEST_CASE("cas: synchronous post failure resumes inline as flush error",
         result = co_await c.cas(bv, remote, 0, 0);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -536,7 +518,7 @@ TEST_CASE("fetch_add: orphan path — awaiter destroyed before CQE",
             result = co_await c.fetch_add(bv, remote, 1);
             done   = true;
         };
-        auto task = run();
+        auto task = elio::test::start_rdma_task(run());
         REQUIRE_FALSE(done);
         captured = st.last_id;
         REQUIRE(captured != 0);
@@ -564,7 +546,7 @@ TEST_CASE("polymorphic cas dispatches via vtable; old value reads through",
         result = co_await c.cas(bv, remote, /*compare=*/0x10, /*swap=*/0x20);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.cas_calls.load() == 1);
@@ -594,7 +576,7 @@ TEST_CASE("polymorphic default (no override) yields ENOTSUP flush error",
             result = co_await c.cas(bv, remote, 1, 2);
             done   = true;
         };
-        auto task = run();
+        auto task = elio::test::start_rdma_task(run());
         REQUIRE(done);
         REQUIRE_FALSE(result.ok());
         REQUIRE(result.wc.status == wc_status::wr_flush_error);
@@ -608,7 +590,7 @@ TEST_CASE("polymorphic default (no override) yields ENOTSUP flush error",
             result = co_await c.fetch_add(bv, remote, 1);
             done   = true;
         };
-        auto task = run();
+        auto task = elio::test::start_rdma_task(run());
         REQUIRE(done);
         REQUIRE(result.wc.status == wc_status::wr_flush_error);
         REQUIRE(result.wc.imm_data == 95u);

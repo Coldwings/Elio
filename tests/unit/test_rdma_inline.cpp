@@ -17,6 +17,7 @@
 // request is rejected unless the user opted in.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -89,26 +90,7 @@ struct state_guard {
     state_guard& operator=(const state_guard&) = delete;
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-    std::coroutine_handle<promise_type> handle;
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() { if (handle) handle.destroy(); }
-};
+using probe_task = elio::coro::task<void>;
 
 template <typename Conn>
 probe_task run_send_buf(Conn& c, buffer_view buf, send_flags flags,
@@ -155,7 +137,7 @@ TEST_CASE("inline send: payload within max_inline_data posts normally",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_send_buf(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send_buf(c, bv, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -182,7 +164,7 @@ TEST_CASE("inline send: payload exactly at max_inline_data still posts",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_send_buf(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send_buf(c, bv, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -207,7 +189,7 @@ TEST_CASE("inline send: payload beyond max_inline_data is rejected pre-post",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_send_buf(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send_buf(c, bv, flags, result, done));
 
     // Awaiter rejected BEFORE calling the backend; no WR posted, no
     // CQE will arrive, coroutine resumed inline.
@@ -238,7 +220,7 @@ TEST_CASE("inline send: started oversized payload is rejected before post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -266,8 +248,8 @@ TEST_CASE("inline send: multi-SGE total exceeds limit → rejected",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_send_span(c, std::span<const sge>(sges),
-                              flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send_span(c, std::span<const sge>(sges),
+                              flags, result, done));
 
     REQUIRE(done);
     REQUIRE(st.sends.load() == 0);
@@ -291,7 +273,7 @@ TEST_CASE("send without inline flag ignores max_inline_data entirely",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send_buf(c, bv, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send_buf(c, bv, send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -316,7 +298,7 @@ TEST_CASE("inline send: default max_inline_data=0 rejects any inline request",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_send_buf(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send_buf(c, bv, flags, result, done));
 
     REQUIRE(done);
     REQUIRE(st.sends.load() == 0);
@@ -341,7 +323,7 @@ TEST_CASE("inline rdma_write: payload within max_inline_data posts normally",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_write_buf(c, bv, remote, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_write_buf(c, bv, remote, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.writes.load() == 1);
@@ -367,7 +349,7 @@ TEST_CASE("inline rdma_write: oversized payload rejected pre-post",
     flags.inline_send = true;
     wc_result result{};
     bool done = false;
-    auto task = run_write_buf(c, bv, remote, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_write_buf(c, bv, remote, flags, result, done));
 
     REQUIRE(done);
     REQUIRE(st.writes.load() == 0);

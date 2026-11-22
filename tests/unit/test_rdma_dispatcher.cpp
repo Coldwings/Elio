@@ -6,15 +6,12 @@
 // These tests exercise both arms of the race and verify the no-resume
 // orphan path.
 //
-// Awaiters and a real backend land in S2/S3; here we drive the
-// dispatcher directly with manually-constructed op_state nodes and a
-// minimal test coroutine. `runtime::schedule_handle` resumes
-// synchronously when no scheduler is current (the same behaviour
-// `sync` primitives and `cancel_token` rely on for non-scheduler
-// callers), which makes the test deterministic and avoids spinning up
-// a scheduler just to observe the resume.
+// Drive the dispatcher with manually constructed op_state nodes and lazy
+// Elio tasks. With no lease or current scheduler, delivery runs the waiter
+// on the notifying thread, and the test retains ownership of the frame.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -31,33 +28,7 @@ using elio::rdma::detail::op_state;
 
 namespace {
 
-// Minimal coroutine type used purely to fabricate a `coroutine_handle<>`
-// for the dispatcher to resume. Body starts suspended (caller hands the
-// handle to the dispatcher first); final_suspend also suspends so the
-// caller controls destruction.
-struct probe_coroutine {
-    struct promise_type {
-        probe_coroutine get_return_object() noexcept {
-            return probe_coroutine{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-
-    std::coroutine_handle<promise_type> handle;
-
-    explicit probe_coroutine(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-
-    ~probe_coroutine() {
-        if (handle) handle.destroy();
-    }
-    probe_coroutine(probe_coroutine&&) = delete;
-    probe_coroutine& operator=(probe_coroutine&&) = delete;
-};
+using probe_coroutine = elio::coro::task<void>;
 
 // Body parameters are captured by reference; the body runs on the first
 // (and only) handle.resume() call from the dispatcher.
@@ -93,7 +64,7 @@ TEST_CASE("dispatcher delivers a single completion to the waiting coroutine",
     auto coro = make_probe(resumes);
 
     auto op = make_pending_op();
-    op->handle = coro.handle;
+    op->handle = elio::coro::detail::task_access::handle(coro);
 
     const auto id = dispatcher::make_wr_id(op.get());
 
@@ -146,7 +117,7 @@ TEST_CASE("dispatcher race: deliver-before-orphan leaves the awaiter to free",
     auto coro = make_probe(resumes);
 
     auto op = make_pending_op();
-    op->handle = coro.handle;
+    op->handle = elio::coro::detail::task_access::handle(coro);
 
     // Dispatcher wins.
     disp.deliver(dispatcher::make_wr_id(op.get()),

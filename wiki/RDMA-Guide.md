@@ -119,6 +119,13 @@ struct wc_result {
 **Errors are returned, not thrown** — same shape as Elio's
 `io_result` / `cancel_result`.
 
+Directly `co_await` a data-path operation from an Elio `coro::task<T>` or
+`coro::generator<T>`, including when awaiting an operation previously
+submitted with `.start()`. If you use a custom coroutine promise, move the
+wait into an Elio task and pass its result back to your caller. This does
+not constrain the completion source: an ordinary polling thread can still
+call `dispatcher::deliver()`.
+
 Constructing one of these operations is lazy: `auto op = conn.recv(buf);`
 does not post a work request by itself. The WR is posted when the awaiter is
 `co_await`ed. When receive preposting or a real send/read/write pipeline is

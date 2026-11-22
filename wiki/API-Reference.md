@@ -6046,6 +6046,18 @@ public:
              std::chrono::duration<Rep, Period> timeout,
              coro::cancel_token token);
 
+    // bindings is an rpc::into or rpc::bind_fields value (see RPC Framework).
+    template<typename Method, detail::bindings_for<typename Method::response_type> B>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request, B bindings,
+             coro::cancel_token token = {});
+
+    template<typename Method, detail::bindings_for<typename Method::response_type> B, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request, B bindings,
+             std::chrono::duration<Rep, Period> timeout,
+             coro::cancel_token token = {});
+
     template<typename Method>
     coro::task<bool> send_oneway(
         const typename Method::request_type& request);

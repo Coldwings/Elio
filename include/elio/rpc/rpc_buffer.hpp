@@ -72,8 +72,9 @@ public:
 /// a request or response, the current writer copies referenced bytes into the
 /// outgoing wire buffer.
 /// 
-/// Client response fields decoded by rpc_client::call retain the received
-/// message. A raw span or pointer extracted from a field does not retain it.
+/// Unbound client response fields decoded by rpc_client::call retain the
+/// received message. A contiguous into binding borrows caller storage; a
+/// scatter-bound field is empty. Extracted raw spans/pointers do not retain storage.
 /// For externally supplied send buffers, the data must remain valid until:
 /// - For client: the RPC call completes
 /// - For server: the cleanup callback is invoked

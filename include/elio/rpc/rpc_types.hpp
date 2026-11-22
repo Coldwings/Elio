@@ -263,6 +263,13 @@ void serialize(buffer_writer& writer, const T& value);
 template<typename T>
 void deserialize(buffer_view& reader, T& value);
 
+namespace detail {
+// Only container count checks use this credit. Individual reads always use
+// the physical view, even when a direct receive omitted a later blob.
+template<typename T>
+void decode_field(buffer_view& reader, T& value, size_t wire_credit);
+}
+
 /// Serialize primitive types
 template<typename T>
 requires is_primitive_v<T>
@@ -325,16 +332,16 @@ void serialize_impl(buffer_writer& writer, const std::vector<T, A>& vec) {
 
 /// Deserialize vector
 template<typename T, typename A>
-void deserialize_impl(buffer_view& reader, std::vector<T, A>& vec) {
+void deserialize_impl(buffer_view& reader, std::vector<T, A>& vec, size_t wire_credit = 0) {
     uint32_t count = reader.read_array_size();
     // Bound count against attacker-controlled DoS: a malicious peer could
     // send count=0xFFFFFFFF to force a 4G * sizeof(T) allocation.
-    check_container_count<min_wire_size_v<T>>(count, reader.remaining());
+    check_container_count<min_wire_size_v<T>>(count, reader.remaining() + wire_credit);
     vec.clear();
     vec.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         T elem;
-        deserialize(reader, elem);
+        detail::decode_field(reader, elem, wire_credit);
         vec.push_back(std::move(elem));
     }
 }
@@ -350,9 +357,9 @@ void serialize_impl(buffer_writer& writer, const std::array<T, N>& arr) {
 
 /// Deserialize std::array
 template<typename T, size_t N>
-void deserialize_impl(buffer_view& reader, std::array<T, N>& arr) {
+void deserialize_impl(buffer_view& reader, std::array<T, N>& arr, size_t wire_credit = 0) {
     for (auto& elem : arr) {
-        deserialize(reader, elem);
+        detail::decode_field(reader, elem, wire_credit);
     }
 }
 
@@ -370,20 +377,20 @@ void serialize_impl(buffer_writer& writer, const Map& map) {
 /// Deserialize map types
 template<typename Map>
 requires is_map_type_v<Map>
-void deserialize_impl(buffer_view& reader, Map& map) {
+void deserialize_impl(buffer_view& reader, Map& map, size_t wire_credit = 0) {
     using K = typename map_types<Map>::key_type;
     using V = typename map_types<Map>::value_type;
 
     uint32_t count = reader.read_array_size();
     // A malicious count would force unbounded hash-bucket / node allocation.
     constexpr size_t pair_min = min_wire_size_v<K> + min_wire_size_v<V>;
-    check_container_count<pair_min>(count, reader.remaining());
+    check_container_count<pair_min>(count, reader.remaining() + wire_credit);
     map.clear();
     for (uint32_t i = 0; i < count; ++i) {
         K key;
         V value;
-        deserialize(reader, key);
-        deserialize(reader, value);
+        detail::decode_field(reader, key, wire_credit);
+        detail::decode_field(reader, value, wire_credit);
         map.emplace(std::move(key), std::move(value));
     }
 }
@@ -399,11 +406,11 @@ void serialize_impl(buffer_writer& writer, const std::optional<T>& opt) {
 
 /// Deserialize optional
 template<typename T>
-void deserialize_impl(buffer_view& reader, std::optional<T>& opt) {
+void deserialize_impl(buffer_view& reader, std::optional<T>& opt, size_t wire_credit = 0) {
     uint8_t has_value = reader.read<uint8_t>();
     if (has_value) {
         T value;
-        deserialize(reader, value);
+        detail::decode_field(reader, value, wire_credit);
         opt = std::move(value);
     } else {
         opt.reset();
@@ -423,10 +430,10 @@ void serialize_impl(buffer_writer& writer, const T& obj) {
 /// Deserialize RPC struct with fields
 template<typename T>
 requires has_rpc_fields_v<T>
-void deserialize_impl(buffer_view& reader, T& obj) {
+void deserialize_impl(buffer_view& reader, T& obj, size_t wire_credit = 0) {
     auto fields = T::_elio_rpc_get_fields();
     std::apply([&](const auto&... field) {
-        (deserialize(reader, field.get(obj)), ...);
+        (detail::decode_field(reader, field.get(obj), wire_credit), ...);
     }, fields);
 }
 
@@ -440,6 +447,18 @@ void serialize(buffer_writer& writer, const T& value) {
 template<typename T>
 void deserialize(buffer_view& reader, T& value) {
     deserialize_impl(reader, value);
+}
+
+template<typename T>
+void detail::decode_field(buffer_view& reader, T& value, size_t wire_credit) {
+    if constexpr (!std::is_same_v<T, std::vector<uint8_t>> &&
+                  requires { deserialize_impl(reader, value, wire_credit); }) {
+        if (wire_credit) {
+            deserialize_impl(reader, value, wire_credit);
+            return;
+        }
+    }
+    deserialize(reader, value);
 }
 
 /// Convenience: serialize to new buffer

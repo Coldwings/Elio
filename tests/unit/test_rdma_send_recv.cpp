@@ -16,14 +16,19 @@
 //     polymorphic_backend vtable.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
+#include <elio/coro/generator.hpp>
 #include <elio/rdma/rdma.hpp>
 
 #include <atomic>
+#include <concepts>
 #include <coroutine>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -157,35 +162,33 @@ struct mock_poly_backend : polymorphic_backend {
     }
 };
 
-// Throwaway coroutine type — initial_suspend = suspend_never so the
-// coroutine runs to the first co_await on creation. final_suspend
-// keeps the frame alive until the test destroys it; that lets us
-// observe `done` and (for the orphan test) destroy the coroutine
-// while it's still suspended on the RDMA awaiter.
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
+using probe_task = elio::coro::task<void>;
 
-    std::coroutine_handle<promise_type> handle;
+struct custom_promise {};
+struct derived_promise : probe_task::promise_type {};
 
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() {
-        if (handle) handle.destroy();
-    }
+template<class Op, class Promise>
+concept accepts_waiter = requires(Op& op, std::coroutine_handle<Promise> h) {
+    { op.await_suspend(h) } noexcept -> std::same_as<bool>;
 };
+
+template<class Op>
+constexpr bool elio_waiters_only =
+    accepts_waiter<Op, probe_task::promise_type> &&
+    accepts_waiter<Op, elio::coro::task<int>::promise_type> &&
+    accepts_waiter<Op, elio::coro::generator<int>::promise_type> &&
+    !accepts_waiter<Op, custom_promise> &&
+    !accepts_waiter<Op, derived_promise> &&
+    !accepts_waiter<Op, void>;
+
+namespace rd = elio::rdma::detail;
+static_assert(elio_waiters_only<rd::send_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::recv_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::rdma_write_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::rdma_read_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::rdma_cas_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::rdma_faa_awaitable<polymorphic_backend>>);
+static_assert(elio_waiters_only<rd::srq_recv_awaitable<polymorphic_backend>>);
 
 template <typename Conn>
 probe_task run_send(Conn& c, buffer_view buf, send_flags flags,
@@ -208,6 +211,33 @@ probe_task run_started(Awaiter op, wc_result& out, bool& done) {
 }
 
 }  // namespace
+
+TEST_CASE("an ordinary thread can deliver a receive completion to an Elio generator",
+          "[rdma][recv][waiter]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp = 0;
+    connection<mock_static_backend> conn{&qp, disp};
+    char payload[8]{};
+    auto produce = [&]() -> elio::coro::generator<wc_result> {
+        auto result = co_await conn.recv(buffer_view{payload, sizeof(payload), 0});
+        co_yield result;
+    };
+    auto gen = produce();
+    std::optional<wc_result> received;
+    auto consume = [&]() -> probe_task { received = co_await gen.next(); };
+    auto task = elio::test::start_rdma_task(consume());
+    REQUIRE(st.recvs.load() == 1);
+    REQUIRE(st.last_recv_id != 0);
+    REQUIRE_FALSE(received.has_value());
+
+    std::thread poller([&] { disp.deliver(st.last_recv_id, wc_status::success, 5); });
+    poller.join();
+    REQUIRE(received.has_value());
+    CHECK(received->ok());
+    CHECK(received->byte_len == 5);
+}
 
 TEST_CASE("unawaited RDMA operations release their unstarted state",
           "[rdma][lifetime]") {
@@ -290,7 +320,7 @@ TEST_CASE("recv: start posts immediately and later await does not repost",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.recvs.load() == 1);
@@ -321,7 +351,7 @@ TEST_CASE("recv: completion before awaiting a started operation resumes inline",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE(st.recvs.load() == 1);
@@ -347,7 +377,7 @@ TEST_CASE("send: inline completion during start is stored for later await",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE(result.ok());
@@ -371,7 +401,7 @@ TEST_CASE("send: started post failure is returned on later await",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -414,7 +444,7 @@ TEST_CASE("send: happy path suspends and dispatcher resumes",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send(c, bv, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -450,7 +480,7 @@ TEST_CASE("send: oversized single-buffer length is rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send(c, bv, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
 
     REQUIRE(done);
     REQUIRE(st.sends.load() == 0);
@@ -478,7 +508,7 @@ TEST_CASE("send: started oversized single-buffer length is returned on await",
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -503,7 +533,7 @@ TEST_CASE("send: inline successful completion resumes after post returns",
     st.inline_done = &done;
     st.inline_send_success = true;
 
-    auto task = run_send(c, bv, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
 
     REQUIRE(st.sends.load() == 1);
     REQUIRE_FALSE(st.resumed_before_post_return);
@@ -528,7 +558,7 @@ TEST_CASE("send: awaited operation forces completion for unsignaled flags",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -553,7 +583,7 @@ TEST_CASE("recv: happy path suspends and dispatcher resumes",
 
     wc_result result{};
     bool done = false;
-    auto task = run_recv(c, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_recv(c, bv, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.recvs.load() == 1);
@@ -585,7 +615,7 @@ TEST_CASE("recv: oversized single-buffer length is rejected pre-post",
 
     wc_result result{};
     bool done = false;
-    auto task = run_recv(c, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_recv(c, bv, result, done));
 
     REQUIRE(done);
     REQUIRE(st.recvs.load() == 0);
@@ -608,7 +638,7 @@ TEST_CASE("send: post failure resumes inline with synthesised flush error",
 
     wc_result result{};
     bool done = false;
-    auto task = run_send(c, bv, send_flags{}, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
 
     // Backend failed synchronously — awaiter must NOT suspend.
     REQUIRE(done);
@@ -635,7 +665,7 @@ TEST_CASE("recv: post failure resumes inline with synthesised flush error",
 
     wc_result result{};
     bool done = false;
-    auto task = run_recv(c, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_recv(c, bv, result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -658,7 +688,7 @@ TEST_CASE("send: orphan race — awaiter destroyed before CQE",
     {
         wc_result result{};
         bool done = false;
-        auto task = run_send(c, bv, send_flags{}, result, done);
+        auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
         REQUIRE_FALSE(done);
         captured = st.last_send_id;
         REQUIRE(captured != 0);
@@ -687,7 +717,7 @@ TEST_CASE("send via polymorphic_backend dispatches through the vtable",
     bool done = false;
     send_flags flags{};
     flags.solicited = true;
-    auto task = run_send(c, bv, flags, result, done);
+    auto task = elio::test::start_rdma_task(run_send(c, bv, flags, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.sends.load() == 1);
@@ -719,7 +749,7 @@ TEST_CASE("recv via polymorphic_backend dispatches through the vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_recv(c, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_recv(c, bv, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.recvs.load() == 1);
@@ -745,7 +775,7 @@ TEST_CASE("send via polymorphic_backend: orphan race",
     {
         wc_result result{};
         bool done = false;
-        auto task = run_send(c, bv, send_flags{}, result, done);
+        auto task = elio::test::start_rdma_task(run_send(c, bv, send_flags{}, result, done));
         REQUIRE_FALSE(done);
         captured = impl.state.last_send_id;
     }

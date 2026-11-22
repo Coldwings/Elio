@@ -111,6 +111,9 @@ if (auto size = file_size("/path/to/file.txt")) {
 
 ### Reading Directory
 
+`read_dir()` returns `std::nullopt` if opening the directory or reading its
+entries fails. An error partway through enumeration does not return a partial list.
+
 ```cpp
 auto entries = read_dir("/path/to/directory");
 if (entries) {

@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The epoll fallback continues servicing ready descriptors and expired timers
+  during sustained regular-file I/O or queued closes (#1305).
+
 - Graceful shutdown no longer stops an I/O owner early when a concurrent grow
   is waiting to reuse its retiring worker slot (#1312).
+- Autoscaler scale wrappers now dispatch nested handlers once per resize
+  request. A thrown resize reports failure and leaves the monitor running;
+  reaching a worker limit does not invoke any handlers (#1318).
+- `io::read_dir()` reports enumeration errors rather than returning a partial
+  directory listing as success (#1306).
 
 ### Added
 
@@ -22,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completion paths honor the retained owner (#1301).
 
 ### Changed
+
+- RDMA data-path operations can be directly awaited only from Elio
+  `coro::task<T>` or `coro::generator<T>`. Move direct waits in custom
+  coroutines into an Elio task. External CQ pollers are unchanged (#1348).
 
 - External submissions to a full worker inbox now use its overflow queue
   immediately instead of spinning on the submitting thread (#1322).

@@ -16,6 +16,7 @@
 // and the multi-SGE overload.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -140,26 +141,7 @@ struct poly_no_srq : polymorphic_backend {
     }
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-    std::coroutine_handle<promise_type> handle;
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() { if (handle) handle.destroy(); }
-};
+using probe_task = elio::coro::task<void>;
 
 template <typename SRQ>
 probe_task run_srq_recv(SRQ& q, buffer_view buf,
@@ -196,7 +178,7 @@ TEST_CASE("srq<Backend>::recv posts to backend and resumes on CQE",
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv(q, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.posts.load() == 1);
@@ -233,7 +215,7 @@ TEST_CASE("srq<Backend>::recv start posts immediately and later await does not r
 
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.posts.load() == 1);
@@ -257,7 +239,7 @@ TEST_CASE("srq<polymorphic_backend>::started default ENOTSUP is awaitable",
     auto op = q.recv(bv).start();
     wc_result result{};
     bool done = false;
-    auto task = run_started(std::move(op), result, done);
+    auto task = elio::test::start_rdma_task(run_started(std::move(op), result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -282,8 +264,8 @@ TEST_CASE("srq<Backend>::recv multi-SGE scatter list",
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv_span(q, std::span<const sge>(sges),
-                                  result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv_span(q, std::span<const sge>(sges),
+                                  result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(st.last_sges.size() == 2u);
@@ -310,7 +292,7 @@ TEST_CASE("srq<Backend>::recv oversized single-buffer length is rejected "
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv(q, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
 
     REQUIRE(done);
     REQUIRE(st.posts.load() == 0);
@@ -333,7 +315,7 @@ TEST_CASE("srq<Backend>::recv post failure resumes inline with flush error",
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv(q, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());
@@ -356,7 +338,7 @@ TEST_CASE("srq<Backend>::recv orphan race — coroutine destroyed before CQE",
     {
         wc_result result{};
         bool done = false;
-        auto task = run_srq_recv(q, bv, result, done);
+        auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
         REQUIRE_FALSE(done);
         captured = st.last_id;
     }
@@ -376,7 +358,7 @@ TEST_CASE("srq<polymorphic_backend>::recv dispatches via vtable",
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv(q, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.posts.load() == 1);
@@ -401,7 +383,7 @@ TEST_CASE("srq<polymorphic_backend>::recv with default post_srq_recv "
 
     wc_result result{};
     bool done = false;
-    auto task = run_srq_recv(q, bv, result, done);
+    auto task = elio::test::start_rdma_task(run_srq_recv(q, bv, result, done));
 
     REQUIRE(done);
     REQUIRE_FALSE(result.ok());

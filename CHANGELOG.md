@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The epoll fallback continues servicing ready descriptors and expired timers
   during sustained regular-file I/O or queued closes (#1305).
+- SSE ignores malformed retry intervals even when their numeric prefix exceeds
+  the parser's 24-hour cap (#1338).
 
 - Graceful shutdown no longer stops an I/O owner early when a concurrent grow
   is waiting to reuse its retiring worker slot (#1312).

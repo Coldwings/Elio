@@ -336,35 +336,30 @@ public:
         // Shut down the underlying socket to force the receive loop's
         // blocked read to return.  Without this, the receive loop stays
         // alive until the peer sends data or TCP keepalive fires (hours).
-        stream_.shutdown_socket();
+        std::exception_ptr shutdown_error;
+        try { stream_.shutdown_socket(); }
+        catch (...) { shutdown_error = std::current_exception(); }
 
         // Move pending requests out of the shard maps before waking them.
         // event::set() may resume a waiter inline when close() is called
         // outside a scheduler; that waiter destroys pending_eraser, which
         // re-enters the same shard mutex.
-        std::vector<std::shared_ptr<pending_request>> pending_to_complete;
         for (auto& shard : pending_shards_) {
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            pending_to_complete.reserve(
-                pending_to_complete.size() + shard.requests.size());
-            for (auto& [id, req] : shard.requests) {
+            decltype(shard.requests) detached;
+            {
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                detached.swap(shard.requests);
+                pending_request_count_.fetch_sub(detached.size(), std::memory_order_acq_rel);
+            }
+            for (auto& [id, req] : detached) {
                 (void)id;
-                pending_to_complete.push_back(std::move(req));
-            }
-            shard.requests.clear();
-        }
-        if (!pending_to_complete.empty()) {
-            pending_request_count_.fetch_sub(
-                pending_to_complete.size(),
-                std::memory_order_acq_rel);
-        }
-
-        for (auto& req : pending_to_complete) {
-            if (req->try_complete()) {
-                req->error = rpc_error::connection_closed;
-                req->publish_completion();
+                if (req->try_complete()) {
+                    req->error = rpc_error::connection_closed;
+                    req->publish_completion();
+                }
             }
         }
+        if (shutdown_error) std::rethrow_exception(shutdown_error);
     }
     
     /// Make an RPC call with default timeout
@@ -419,7 +414,7 @@ public:
         return call_impl<Method>(request, timeout, std::move(token));
     }
 
-    template<typename Method, detail::bindings B>
+    template<typename Method, detail::bindings_for<typename Method::response_type> B>
     coro::task<rpc_result<typename Method::response_type>> call(
         const typename Method::request_type& request, B bindings, coro::cancel_token token = {})
     {
@@ -427,7 +422,7 @@ public:
                             std::chrono::milliseconds(default_timeout_ms), std::move(token));
     }
 
-    template<typename Method, detail::bindings B, typename Rep, typename Period>
+    template<typename Method, detail::bindings_for<typename Method::response_type> B, typename Rep, typename Period>
     coro::task<rpc_result<typename Method::response_type>> call(
         const typename Method::request_type& request, B bindings,
         std::chrono::duration<Rep, Period> timeout, coro::cancel_token token = {})
@@ -859,18 +854,18 @@ private:
         }
 
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
-        auto* stream_ptr = &stream_;
+        auto owner = this->shared_from_this();
         auto timeout = config_.frame_read_timeout;
         coro::cancel_source watchdog_cancel;
         auto wd_token = watchdog_cancel.get_token();
 
         auto* current_worker = runtime::worker_thread::current();
-        auto watchdog_body = [stream_ptr, timed_out, timeout, wd_token]()
+        auto watchdog_body = [owner, timed_out, timeout, wd_token]()
                                  -> coro::task<void> {
             auto result = co_await elio::time::sleep_for(timeout, wd_token);
             if (result == coro::cancel_result::completed) {
                 timed_out->store(true, std::memory_order_release);
-                stream_ptr->shutdown_socket();
+                owner->stream_.shutdown_socket();
             }
             co_return;
         };
@@ -878,7 +873,13 @@ private:
             ? sched->go_joinable_to(current_worker->worker_id(), watchdog_body)
             : sched->go_joinable(watchdog_body);
 
-        auto frame = co_await detail::read_frame_routed(stream_, config_.max_message_size, route);
+        detail::frame_result frame;
+        try {
+            frame = co_await detail::read_frame_routed(stream_, config_.max_message_size, route);
+        } catch (...) {
+            // A throwing transport or allocation leaves the frame unusable.
+            // Always cancel and join the already-started watchdog below.
+        }
 
         watchdog_cancel.cancel();
         co_await std::move(watchdog);
@@ -930,7 +931,13 @@ private:
             }
 
             std::shared_ptr<pending_request> response;
-            auto frame = co_await self->read_frame_with_deadline(response);
+            detail::frame_result frame;
+            try {
+                frame = co_await self->read_frame_with_deadline(response);
+            } catch (...) {
+                // Includes frame/watchdog setup failure and reads without a
+                // watchdog. Publish closure instead of abandoning pending calls.
+            }
             if (!frame) {
                 ELIO_LOG_DEBUG("RPC client receive loop: connection closed");
                 self->close();

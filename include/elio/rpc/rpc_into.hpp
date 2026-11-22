@@ -29,14 +29,16 @@ struct blob_target {
     }
 };
 
-template<auto... Members>
+template<bool Scatter, auto... Members>
 struct field_bindings {
+    static constexpr bool has_scatter = Scatter;
     std::array<blob_target, sizeof...(Members)> targets;
 };
 
 template<class T> struct is_bindings : std::false_type {};
-template<auto... M> struct is_bindings<field_bindings<M...>> : std::true_type {};
-template<class T> concept bindings = is_bindings<T>::value;
+template<bool S, auto... M> struct is_bindings<field_bindings<S, M...>> : std::true_type {};
+template<class T, class R> concept bindings_for = is_bindings<T>::value &&
+    (!T::has_scatter || std::is_nothrow_move_constructible_v<R>);
 
 template<class T> struct blob_member {};
 template<class R> struct blob_member<buffer_ref R::*> { using response = R; };
@@ -48,7 +50,7 @@ template<auto M> concept blob_member_pointer = requires { typename blob_member<d
 /// remains exclusively borrowed until the call returns, including on error.
 template<auto Member> requires detail::blob_member_pointer<Member>
 auto into(std::span<uint8_t> dst) {
-    return detail::field_bindings<Member>{{detail::blob_target{dst, {}, nullptr, 0}}};
+    return detail::field_bindings<false, Member>{{detail::blob_target{dst, {}, nullptr, 0}}};
 }
 
 template<auto Member> requires detail::blob_member_pointer<Member>
@@ -58,20 +60,21 @@ auto into(std::span<std::byte> dst) {
 
 /// Scatter one logical blob over the supplied segments. Descriptors are
 /// copied, not the pages. On success written is the actual length and the
-/// corresponding (contiguous-only) buffer_ref is empty.
+/// corresponding (contiguous-only) buffer_ref is empty. Result transfer
+/// must not throw after publishing the external count.
 template<auto Member> requires detail::blob_member_pointer<Member>
 auto into(std::span<const iovec> dst, size_t& written) {
     for (const auto& v : dst) {
         if (v.iov_len && !v.iov_base) throw std::invalid_argument("null RPC receive segment");
     }
-    return detail::field_bindings<Member>{{detail::blob_target{
+    return detail::field_bindings<true, Member>{{detail::blob_target{
         {}, std::vector<iovec>(dst.begin(), dst.end()), &written, 0}}};
 }
 
-template<auto... M>
+template<bool... S, auto... M>
 requires (sizeof...(M) >= 2)
-auto bind_fields(detail::field_bindings<M>... field) {
-    return detail::field_bindings<M...>{{std::move(field.targets[0])...}};
+auto bind_fields(detail::field_bindings<S, M>... field) {
+    return detail::field_bindings<(S || ...), M...>{{std::move(field.targets[0])...}};
 }
 
 namespace detail {
@@ -256,7 +259,8 @@ public:
 
 // Locate variable-width metadata preceding the last bound blob without
 // looking ahead into a destination. Everything after it is copied in one
-// read and can use the ordinary synchronous decoder, including custom types.
+// read and can use the ordinary synchronous decoder, including custom codecs
+// which consume sequentially and do not inspect the entire original frame.
 template<class T>
 coro::task<void> copy_wire_field(field_input& in);
 
@@ -334,7 +338,7 @@ consteval size_t field_index() {
     }
 }
 
-template<class R, auto... M>
+template<class R, bool S, auto... M>
 class receive_plan final : public typed_receive<R> {
     static constexpr std::array indices{field_index<R, M>()...};
     static_assert([] {
@@ -343,7 +347,7 @@ class receive_plan final : public typed_receive<R> {
                 if (indices[i] == indices[j]) return false;
         return true;
     }(), "RPC into cannot bind the same field twice");
-    field_bindings<M...> bindings_;
+    field_bindings<S, M...> bindings_;
 
     template<size_t I>
     coro::task<void> walk(field_input& in) {
@@ -362,7 +366,7 @@ class receive_plan final : public typed_receive<R> {
         }
     }
 public:
-    explicit receive_plan(field_bindings<M...> bindings) : bindings_(std::move(bindings)) {}
+    explicit receive_plan(field_bindings<S, M...> bindings) : bindings_(std::move(bindings)) {}
     coro::task<void> decode(field_input& in) override { return walk<0>(in); }
     R parse(buffer_view& view) override {
         R result;
@@ -391,9 +395,9 @@ public:
     }
 };
 
-template<class R, auto... M>
-auto make_receive_plan(field_bindings<M...> bindings) {
-    return std::make_shared<receive_plan<R, M...>>(std::move(bindings));
+template<class R, bool S, auto... M>
+auto make_receive_plan(field_bindings<S, M...> bindings) {
+    return std::make_shared<receive_plan<R, S, M...>>(std::move(bindings));
 }
 
 } // namespace detail

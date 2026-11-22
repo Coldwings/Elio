@@ -307,13 +307,20 @@ if (r.ok()) consume_pages(pages, received, r->generation);
 The segment descriptors are copied at binding time. On success, `received`
 is the field's length, and the corresponding `r->data` is empty: a single
 contiguous `buffer_ref` cannot represent disjoint pages. On failure the
-count is not committed. A contiguous bound field instead borrows exactly
+count is not committed. Scatter therefore requires a nothrow-move-constructible
+reply: the final transfer of the typed result cannot fail after publishing a count.
+Ordinary calls and contiguous bindings do not have this restriction.
+A contiguous bound field instead borrows exactly
 the written prefix and does **not** extend the lifetime of the caller's memory.
 Use `rpc::bind_fields(rpc::into<&Reply::a>(...), rpc::into<&Reply::b>(...))`
 for several distinct fields. Member pointers must designate registered
-top-level `buffer_ref` fields. Preceding metadata must use the standard RPC
-wire codecs (including variable-length fields, nested structs and containers);
-following fields are decoded normally. No full-frame staging buffer or
+top-level `buffer_ref` fields of a response using the registered field layout.
+Preceding metadata must use the standard RPC wire codecs (including
+variable-length fields, nested structs and containers). Custom codecs after
+the last binding may read their own bytes sequentially, but cannot depend on
+absolute offsets or inspect the complete original payload: bound bytes are not
+in the decoder's view. Use an unbound call for whole-frame codecs.
+No full-frame staging buffer or
 post-receive copy is used for the bound blob. This is a receive-side guarantee,
 not a claim about kernel copies or send serialization.
 

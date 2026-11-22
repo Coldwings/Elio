@@ -27,6 +27,34 @@ struct empty_members_reply {
 };
 using empty_members_method = method_descriptor<42, empty_request, empty_members_reply>;
 
+struct trailer {
+    uint32_t gen;
+    friend void serialize_impl(buffer_writer& w, const trailer& t) { w.write(t.gen); }
+    friend void deserialize_impl(buffer_view& v, trailer& t) { t.gen = v.read<uint32_t>(); }
+};
+struct wire_reply {
+    std::string label;
+    buffer_ref data;
+    trailer suffix;
+    ELIO_RPC_FIELDS(wire_reply, label, data, suffix)
+};
+using wire_method = method_descriptor<43, empty_request, wire_reply>;
+
+struct throwing_transfer {
+    buffer_ref data;
+    throwing_transfer() = default;
+    throwing_transfer(throwing_transfer&&) noexcept(false) {}
+    ELIO_RPC_FIELDS(throwing_transfer, data)
+};
+template<class R, auto M> concept can_scatter = requires(tcp_rpc_client& c, empty_request& req,
+                                                         std::span<const iovec> iov, size_t& n) {
+    c.call<method_descriptor<42, empty_request, R>>(req, into<M>(iov, n));
+};
+static_assert(can_scatter<reply, &reply::data> && !can_scatter<throwing_transfer, &throwing_transfer::data>);
+static_assert(requires(tcp_rpc_client& c, empty_request& req, std::span<uint8_t> dst) {
+    c.call<method_descriptor<42, empty_request, throwing_transfer>>(req, into<&throwing_transfer::data>(dst));
+});
+
 struct peer {
     std::deque<uint8_t> input;
     sync::event readable;
@@ -45,6 +73,7 @@ struct peer {
     bool empty_members = false;
     bool invalid_suffix = false;
     bool fail_send = false;
+    bool throw_read = false;
     std::vector<uint32_t> requests;
 
     void respond(uint32_t id) {
@@ -81,6 +110,7 @@ struct stream {
     bool is_valid() const { return p->valid; }
     void shutdown_socket() { p->valid = false; p->readable.set(); }
     coro::task<io::io_result> read_exactly(void* to, size_t n) {
+        if (p->throw_read && !p->requests.empty()) throw std::runtime_error("fixture read failure");
         if (p->pause_at == to) {
             p->reading_target.set();
             co_await p->allow_read.wait();
@@ -124,9 +154,9 @@ struct stream {
 using client = rpc_client<stream>;
 
 template<class F>
-auto run(F fn) {
+auto run(F fn, size_t workers = 1) {
     using result_type = typename std::invoke_result_t<F&, runtime::scheduler&>::value_type;
-    runtime::scheduler s(1);
+    runtime::scheduler s(workers);
     s.start();
     std::promise<void> completed;
     auto signal = completed.get_future();
@@ -387,7 +417,91 @@ TEST_CASE("RPC destination settlement needs no event wait or dispatch allocation
     CHECK(untouched);
 }
 
+TEST_CASE("RPC throwing frame read closes pending calls and releases the watchdog", "[rpc][into]") {
+    std::chrono::seconds timeout = 30s;
+    SECTION("frame watchdog enabled") {}
+    SECTION("no frame watchdog") { timeout = 0s; }
+    auto p = std::make_shared<peer>();
+    p->throw_read = true;
+    std::array<uint8_t, 8> dst{};
+    std::weak_ptr<client> weak;
+    auto error = run([&](auto&) -> coro::task<rpc_error> {
+        auto c = client::create(stream{p}, {.frame_read_timeout = timeout});
+        weak = c;
+        auto r = co_await c->call<method>(empty_request{}, into<&reply::data>(dst));
+        co_return r.error();
+    });
+    CHECK(error == rpc_error::connection_closed);
+    CHECK_FALSE(p->valid);
+    CHECK(weak.expired());
+}
+
+TEST_CASE("RPC cancellation on a different Elio worker seals a real destination read", "[rpc][into]") {
+    struct pause {
+        void* target;
+        sync::event admitted, release;
+        std::atomic<size_t> reader{2};
+    };
+    struct gated_socket : net::tcp_stream {
+        pause* barrier;
+        gated_socket(net::tcp_stream socket, pause* p) : net::tcp_stream(std::move(socket)), barrier(p) {}
+        coro::task<io::io_result> read_exactly(void* dst, size_t n) {
+            if (dst == barrier->target) {
+                barrier->reader.store(runtime::worker_thread::current()->worker_id());
+                barrier->admitted.set();
+                co_await barrier->release.wait();
+            }
+            co_return co_await net::tcp_stream::read_exactly(dst, n);
+        }
+    };
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    auto a = net::tcp_stream::adopt(fds[0]), b = net::tcp_stream::adopt(fds[1]);
+    REQUIRE(a);
+    REQUIRE(b);
+    std::array<uint8_t, 2> first{}, second{99, 99};
+    pause barrier{};
+    barrier.target = first.data();
+    size_t written = 77;
+    auto ok = run([&](runtime::scheduler& s) -> coro::task<bool> {
+        auto c = rpc_client<gated_socket>::create(gated_socket(std::move(*a), &barrier));
+        auto remote = s.go_joinable([&]() -> coro::task<bool> {
+            auto request = co_await read_frame(*b);
+            if (!request) co_return false;
+            std::array<uint8_t, 3> bytes{1, 2, 3};
+            reply r{{}, buffer_ref(bytes.data(), bytes.size()), 1, {}, {}};
+            auto frame = build_response(request->first.request_id, r, false);
+            co_return co_await write_frame(*b, frame.first, frame.second);
+        });
+        empty_request req;
+        coro::cancel_source stop;
+        std::array<iovec, 2> iov{{{first.data(), 2}, {second.data(), 2}}};
+        auto call = s.go_joinable(c->call<method>(req, into<&reply::data>(iov, written), 5s, stop.get_token()));
+        co_await barrier.admitted.wait();
+        size_t other = 1 - barrier.reader.load();
+        auto cancelling = s.go_joinable_to(other, [&]() -> coro::task<size_t> {
+            auto id = runtime::worker_thread::current()->worker_id();
+            stop.cancel();
+            co_return id;
+        });
+        auto cancel_worker = co_await std::move(cancelling);
+        bool held = !call.is_ready();
+        barrier.release.set();
+        auto res = co_await std::move(call);
+        bool sent = co_await std::move(remote);
+        c->close();
+        co_return held && sent && cancel_worker == other && res.error() == rpc_error::cancelled;
+    }, 2);
+    CHECK(ok);
+    CHECK(written == 77);
+    CHECK(first == std::array<uint8_t, 2>{1, 2});
+    CHECK(second == std::array<uint8_t, 2>{99, 99});
+}
+
 TEST_CASE("RPC field binding uses the unchanged wire protocol on a real stream", "[rpc][into]") {
+    bool checksum = false;
+    SECTION("default framing") {}
+    SECTION("checksummed framing") { checksum = true; }
     int fds[2];
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
     auto a = net::tcp_stream::adopt(fds[0]);
@@ -402,15 +516,15 @@ TEST_CASE("RPC field binding uses the unchanged wire protocol on a real stream",
             auto request = co_await read_frame(*b);
             if (!request) co_return false;
             std::vector<uint8_t> bytes(5000, 37);
-            reply response{{"remote"}, buffer_ref(bytes), 11, {}, {}};
-            auto frame = build_response(request->first.request_id, response, true);
+            wire_reply response{"remote", buffer_ref(bytes), {11}};
+            auto frame = build_response(request->first.request_id, response, checksum);
             co_return co_await write_frame(*b, frame.first, frame.second);
         });
         std::array<iovec, 2> pages{{{first.data(), first.size()}, {second.data(), second.size()}}};
-        auto r = co_await c->call<method>(empty_request{}, into<&reply::data>(pages, n));
+        auto r = co_await c->call<wire_method>(empty_request{}, into<&wire_reply::data>(pages, n));
         c->close();
         auto sent = co_await std::move(remote);
-        co_return sent && r.ok() && r->generation == 11;
+        co_return sent && r.ok() && r->label == "remote" && r->suffix.gen == 11;
     });
     REQUIRE(ok);
     REQUIRE(n == 5000);

@@ -268,7 +268,15 @@ server.register_method_with_cleanup<GetFileData>(
 received payload. When serializing a response or request, the current
 implementation copies the referenced bytes into the outgoing wire buffer.
 
-**Important**: The referenced data must remain valid until:
+A `buffer_ref` decoded by `rpc_client::call()` retains its received
+message, including when the response or field is copied or moved out of
+`rpc_result`. A pointer, span, `std::string_view`, or `iovec` obtained from the
+field does not retain the bytes: keep an owning field alive while using it. Moving an owning
+`buffer_ref` or `buffer_view` transfers its backing and leaves the source
+empty. Direct deserialization from a caller-supplied `buffer_view` still
+borrows the caller's storage; moving a borrowed view does not extend its lifetime.
+
+For externally supplied send buffers, the referenced data must remain valid until:
 - For client: the RPC call completes
 - For server: the cleanup callback is invoked
 

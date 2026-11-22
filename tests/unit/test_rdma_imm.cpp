@@ -8,6 +8,7 @@
 // value, and that omitting the IMM API leaves with_imm=false.
 
 #include <catch2/catch_test_macros.hpp>
+#include "rdma_test_task.hpp"
 
 #include <elio/rdma/rdma.hpp>
 
@@ -108,26 +109,7 @@ struct imm_poly_backend : polymorphic_backend {
     }
 };
 
-struct probe_task {
-    struct promise_type {
-        probe_task get_return_object() noexcept {
-            return probe_task{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() {}
-    };
-    std::coroutine_handle<promise_type> handle;
-    explicit probe_task(std::coroutine_handle<promise_type> h) noexcept
-        : handle(h) {}
-    probe_task(const probe_task&) = delete;
-    probe_task& operator=(const probe_task&) = delete;
-    probe_task(probe_task&&) = delete;
-    probe_task& operator=(probe_task&&) = delete;
-    ~probe_task() { if (handle) handle.destroy(); }
-};
+using probe_task = elio::coro::task<void>;
 
 }  // namespace
 
@@ -148,7 +130,7 @@ TEST_CASE("send_with_imm sets with_imm flag and carries imm_data",
         result = co_await c.send_with_imm(bv, /*imm=*/0xDEADBEEF);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.sends.load() == 1);
@@ -182,7 +164,7 @@ TEST_CASE("plain send does NOT set with_imm even with non-zero default",
         result = co_await c.send(bv);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE_FALSE(st.last_flags.with_imm);
@@ -209,7 +191,7 @@ TEST_CASE("rdma_write_with_imm sets with_imm flag and carries imm_data",
         result = co_await c.rdma_write_with_imm(bv, remote, 0x12345678);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(st.writes.load() == 1);
@@ -237,7 +219,7 @@ TEST_CASE("polymorphic send_with_imm dispatches via vtable and carries imm",
         result = co_await c.send_with_imm(bv, 0xABABABAB);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE_FALSE(done);
     REQUIRE(impl.state.last_flags.with_imm);
@@ -270,7 +252,7 @@ TEST_CASE("send_with_imm respects an explicitly-passed flags struct",
         result = co_await c.send_with_imm(bv, 0xFEEDBABE, flags);
         done   = true;
     };
-    auto task = run();
+    auto task = elio::test::start_rdma_task(run());
 
     REQUIRE(st.last_flags.with_imm);
     REQUIRE(st.last_flags.solicited);

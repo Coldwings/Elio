@@ -295,8 +295,8 @@ private:
                     if (c >= '0' && c <= '9') {
                         retry = retry * 10 + (c - '0');
                         if (retry > 86400000LL) {
+                            // Saturate the number, but still validate the rest of the field.
                             retry = 86400000LL;
-                            break;
                         }
                     } else {
                         valid = false;

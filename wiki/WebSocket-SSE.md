@@ -408,7 +408,9 @@ data: This is line 2
 
 - `id:` - Event ID for reconnection tracking
 - `event:` - Event type (default: "message")
-- `retry:` - Reconnection interval in milliseconds
+- `retry:` - Reconnection interval in milliseconds. Only ASCII digits are
+  accepted; an invalid field leaves the previous interval unchanged. Elio
+  caps valid intervals at 24 hours.
 - `data:` - Event data (can span multiple lines)
 - Empty line marks end of event
 

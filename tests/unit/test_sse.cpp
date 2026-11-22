@@ -610,6 +610,16 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         REQUIRE(parser.retry_ms() == 3000);
     }
     
+    SECTION("retry validates the entire field even after reaching its limit") {
+        event_parser parser;
+        parser.parse("retry: 17\nretry: 90000000ms\n");
+        CHECK(parser.retry_ms() == 17);
+        parser.parse("retry: 900000000000000000000000000000\n");
+        CHECK(parser.retry_ms() == 86400000);
+        parser.parse("retry: 0\n");
+        CHECK(parser.retry_ms() == 0);
+    }
+
     SECTION("last event id persists across events") {
         event_parser parser;
         

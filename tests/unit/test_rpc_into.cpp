@@ -19,6 +19,14 @@ struct reply {
 };
 using method = method_descriptor<41, empty_request, reply>;
 
+struct empty_members_reply {
+    std::vector<empty_response> prefix;
+    buffer_ref data;
+    std::vector<empty_response> suffix;
+    ELIO_RPC_FIELDS(empty_members_reply, prefix, data, suffix)
+};
+using empty_members_method = method_descriptor<42, empty_request, empty_members_reply>;
+
 struct peer {
     std::deque<uint8_t> input;
     sync::event readable;
@@ -34,6 +42,9 @@ struct peer {
     bool hold_response = false;
     bool send_error = false;
     bool trailing_field = false;
+    bool empty_members = false;
+    bool invalid_suffix = false;
+    bool fail_send = false;
     std::vector<uint32_t> requests;
 
     void respond(uint32_t id) {
@@ -41,6 +52,11 @@ struct peer {
         reply r{{"a", "variable length"}, buffer_ref(bytes.data(), blob_size),
                 id, buffer_ref(bytes.data() + 6, 2), buffer_ref(bytes.data(), 1)};
         auto [h, payload] = build_response(id, r, true);
+        if (empty_members) {
+            empty_members_reply e{std::vector<empty_response>(12), r.data,
+                                  std::vector<empty_response>(invalid_suffix ? 1 : 0)};
+            std::tie(h, payload) = build_response(id, e, true);
+        }
         if (send_error) std::tie(h, payload) = build_error_response(id, rpc_error::method_not_found, "missing", true);
         if (trailing_field) {
             payload.write(uint8_t{42});
@@ -90,6 +106,10 @@ struct stream {
             else if (p->requests.size() == 2) {
                 p->respond(h.request_id);
                 p->respond(p->requests[0]);
+            }
+            if (p->fail_send) {
+                co_await p->reading_target.wait();
+                throw std::bad_alloc();
             }
         }
         size_t n = 0;
@@ -290,6 +310,81 @@ TEST_CASE("RPC field bindings commit counts only after typed exact consumption",
     CHECK(errors.first == rpc_error::serialization_error);
     CHECK(errors.second == rpc_error::success);
     CHECK(n == 77);
+}
+
+TEST_CASE("RPC bound and ordinary count checks see the same original wire extent", "[rpc][into]") {
+    auto p = std::make_shared<peer>();
+    p->empty_members = true;
+    std::array<uint8_t, 5> dst{};
+    SECTION("empty elements before a bound blob retain their count") {}
+    SECTION("a later count gets no credit from an earlier bound blob") { p->invalid_suffix = true; }
+    auto pair = run([&](auto&) -> coro::task<std::pair<rpc_result<empty_members_reply>,
+                                                     rpc_result<empty_members_reply>>> {
+        auto c = client::create(stream{p}, {.frame_read_timeout = 0s});
+        empty_request req;
+        auto ordinary = co_await c->call<empty_members_method>(req);
+        auto bound = co_await c->call<empty_members_method>(req, into<&empty_members_reply::data>(dst));
+        c->close();
+        co_return std::pair{std::move(ordinary), std::move(bound)};
+    });
+    REQUIRE(pair.second.error() == pair.first.error());
+    if (p->invalid_suffix) {
+        CHECK(pair.first.error() == rpc_error::serialization_error);
+    } else {
+        REQUIRE(pair.first.ok());
+        CHECK(pair.first->prefix.size() == 12);
+        CHECK(pair.second->prefix.size() == 12);
+        CHECK(pair.second->data.data() == dst.data());
+        CHECK(dst == std::array<uint8_t, 5>{1, 2, 3, 4, 5});
+    }
+}
+
+TEST_CASE("RPC send allocation failure waits for an admitted destination read", "[rpc][into]") {
+    using gate = elio::rpc::detail::into_gate;
+    auto p = std::make_shared<peer>();
+    std::array<uint8_t, 5> dst{};
+    p->fail_send = true;
+    p->pause_at = dst.data();
+    sync::event sealed;
+    gate::quiescence_wait_for_test.store(&sealed);
+    struct reset_hook { ~reset_hook() { gate::quiescence_wait_for_test.store(nullptr); } } reset;
+    auto observed = run([&](runtime::scheduler& s) -> coro::task<std::pair<bool, bool>> {
+        auto c = client::create(stream{p}, {.frame_read_timeout = 0s});
+        empty_request req;
+        auto pending = s.go_joinable(c->call<method>(req, into<&reply::data>(dst)));
+        co_await sealed.wait();
+        bool held = !pending.is_ready();
+        p->allow_read.set();
+        bool threw = false;
+        try { (void)co_await std::move(pending); }
+        catch (const std::bad_alloc&) { threw = true; }
+        c->close();
+        co_return std::pair{held, threw};
+    });
+    CHECK(observed.first);
+    CHECK(observed.second);
+}
+
+TEST_CASE("RPC destination settlement needs no event wait or dispatch allocation", "[rpc][into]") {
+    bool untouched = run([&](runtime::scheduler& sched) -> coro::task<bool> {
+        elio::rpc::detail::into_gate gate;
+        if (!gate.enter()) co_return false;
+        bool started = false;
+        auto child = sched.go_joinable([&]() -> coro::task<void> {
+            sync::detail::fail_next_wake_state_allocation_for_test.store(true);
+            started = true;
+            co_await gate.wait_settled();
+        });
+        while (!started) co_await time::yield();
+        gate.seal();
+        auto old = sync::detail::event_dispatch_storage_for_test.exchange(+[] { throw std::bad_alloc(); });
+        gate.leave();
+        sync::detail::event_dispatch_storage_for_test.store(old);
+        bool unused = sync::detail::fail_next_wake_state_allocation_for_test.exchange(false);
+        co_await std::move(child);
+        co_return unused;
+    });
+    CHECK(untouched);
 }
 
 TEST_CASE("RPC field binding uses the unchanged wire protocol on a real stream", "[rpc][into]") {

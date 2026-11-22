@@ -81,7 +81,13 @@ namespace detail {
 class into_gate {
     enum phase { idle, writing, sealed, sealing };
     std::atomic<phase> phase_{idle};
-    sync::event released_;
+    // Exactly one call waits for both terminal publication and the final
+    // admitted read. Its wake state lives in the plan before admission.
+    sync::detail::wake_state settled_;
+    void signal() noexcept {
+        if (settled_.claim_notification() == sync::detail::wake_action::schedule)
+            settled_.schedule_claimed();
+    }
 public:
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     static inline std::atomic<sync::event*> quiescence_wait_for_test{nullptr};
@@ -90,28 +96,37 @@ public:
         phase expected = idle;
         return phase_.compare_exchange_strong(expected, writing, std::memory_order_acq_rel);
     }
-    void leave() {
+    void leave() noexcept {
         phase expected = writing;
         if (!phase_.compare_exchange_strong(expected, idle, std::memory_order_acq_rel)) {
             phase_.store(sealed, std::memory_order_release);
-            released_.set();
+            signal();
         }
     }
     void seal() noexcept {
         auto p = phase_.load(std::memory_order_acquire);
         while (p == idle || p == writing) {
             if (phase_.compare_exchange_weak(p, p == idle ? sealed : sealing,
-                                             std::memory_order_acq_rel)) break;
-        }
-    }
-    coro::task<void> wait_quiescent() {
-        if (phase_.load(std::memory_order_acquire) == sealing) {
+                                             std::memory_order_acq_rel)) {
+                if (p == idle) signal();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-            if (auto* notice = quiescence_wait_for_test.load(std::memory_order_acquire)) notice->set();
+                else if (auto* notice = quiescence_wait_for_test.load(std::memory_order_acquire))
+                    notice->set();
 #endif
-            co_await released_.wait();
+                return;
+            }
         }
     }
+    struct wait {
+        sync::detail::wake_state& state;
+        bool await_ready() const noexcept { return state.notification_was_selected(); }
+        bool await_suspend(std::coroutine_handle<> h) const noexcept {
+            return state.set_handle_blocked(h) && state.unblock_after_publish();
+        }
+        void await_resume() const noexcept {}
+        ~wait() { state.abandon(); }
+    };
+    wait wait_settled() noexcept { return {settled_}; }
 };
 
 struct frame_io_failure {};
@@ -300,6 +315,7 @@ coro::task<void> copy_wire_field(field_input& in) {
 template<class R>
 class typed_receive : public bound_receive {
 public:
+    virtual R parse(buffer_view&) = 0;
     virtual void commit(R&) = 0;
 };
 
@@ -307,7 +323,8 @@ template<class R, auto M, size_t I = 0>
 consteval size_t field_index() {
     constexpr auto fields = R::_elio_rpc_get_fields();
     if constexpr (I == std::tuple_size_v<decltype(fields)>) {
-        static_assert(I != I, "RPC into must bind a registered top-level response buffer_ref");
+        static_assert(I < std::tuple_size_v<decltype(fields)>,
+                      "RPC into must bind a registered top-level response buffer_ref");
     } else {
         constexpr auto pointer = std::get<I>(fields).ptr;
         if constexpr (std::is_same_v<std::remove_cv_t<decltype(pointer)>, decltype(M)>) {
@@ -347,6 +364,20 @@ class receive_plan final : public typed_receive<R> {
 public:
     explicit receive_plan(field_bindings<M...> bindings) : bindings_(std::move(bindings)) {}
     coro::task<void> decode(field_input& in) override { return walk<0>(in); }
+    R parse(buffer_view& view) override {
+        R result;
+        size_t credit = 0;
+        for (const auto& target : bindings_.targets) credit += target.length;
+        size_t index = 0;
+        auto read_member = [&](auto member) {
+            auto slot = std::find(indices.begin(), indices.end(), index++);
+            if (slot != indices.end()) credit -= bindings_.targets[slot - indices.begin()].length;
+            decode_field(view, member.get(result), credit);
+        };
+        std::apply([&](auto... member) { (read_member(member), ...); }, R::_elio_rpc_get_fields());
+        require_typed_payload_consumed(view);
+        return result;
+    }
     void commit(R& response) override {
         size_t i = 0;
         auto install = [&](buffer_ref& field) {

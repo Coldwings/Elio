@@ -93,9 +93,9 @@ struct pending_request {
 
     /// Publish the completed state after response/error fields are written.
     void publish_completion() noexcept {
-        if (receiver) receiver->gate.seal();
         published.store(true, std::memory_order_release);
-        completion_event.set();
+        if (receiver) receiver->gate.seal();
+        else completion_event.set();
     }
     
     /// Check if completed (read-only)
@@ -637,14 +637,19 @@ private:
         } catch (...) {
             if (!receiver) throw;
             send_exception = std::current_exception();
-            close();
             complete_pending_with_error(pending, rpc_error::connection_closed);
+            // A custom transport may also throw on shutdown. The original
+            // send error is reported only after our destination has settled.
+            try { close(); } catch (...) {}
         }
 
         // Wait for completion (either response, timeout, or cancellation)
-        co_await pending->completion_event.wait();
+        if (receiver) {
+            co_await receiver->gate.wait_settled();
+        } else {
+            co_await pending->completion_event.wait();
+        }
         (void)pending->is_published();
-        if (receiver) co_await receiver->gate.wait_quiescent();
 
         // Cancel the watcher and any cancellable local send await once the
         // request has completed, regardless of how completion happened.
@@ -679,7 +684,7 @@ private:
             // buffer_ref retains it beyond return from call().
             buffer_view view = detail::retained_message_view(
                 std::shared_ptr<const message_buffer>(pending, &pending->response_data));
-            Response response = parse_response<Response>(view);
+            Response response = receiver ? receiver->parse(view) : parse_response<Response>(view);
             if (receiver) receiver->commit(response);
             co_return rpc_result<Response>(std::move(response));
         } catch (const serialization_error& e) {

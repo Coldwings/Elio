@@ -291,6 +291,18 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         // Retry should be updated
         REQUIRE(parser.retry_ms() == 5000);
     }
+
+    SECTION("advertised retry distinguishes the default from a server field") {
+        event_parser parser;
+        REQUIRE_FALSE(parser.advertised_retry_ms().has_value());
+        REQUIRE(parser.retry_ms() == 3000);
+        parser.parse("retry: 0\n\n");
+        REQUIRE(parser.advertised_retry_ms() == 0);
+        parser.parse("retry: 3000\n\n");
+        parser.reset();
+        parser.parse("retry: invalid\n\n");
+        REQUIRE(parser.advertised_retry_ms() == 3000);
+    }
     
     SECTION("parse multiline data") {
         event_parser parser;
@@ -2076,6 +2088,30 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     } observer;
     http::detail::observe_client_response_read_entry_for_test.store(false);
     http::detail::client_response_read_staged_for_test.store(false);
+    http::detail::sse_reconnect_wait_ms_for_test.store(-1);
+
+    std::string retry_field;
+    int configured_retry_ms = 7;
+    int expected_retry_ms = 7;
+    size_t unavailable_responses = 0;
+    SECTION("no server retry uses the configured default") {}
+    SECTION("a zero server retry retains the configured fallback") {
+        retry_field = "retry: 0\n";
+    }
+    SECTION("a positive server retry overrides the configured default") {
+        retry_field = "retry: 11\n";
+        expected_retry_ms = 11;
+    }
+    SECTION("a nonpositive configured default does not delay reconnect") {
+        configured_retry_ms = -1;
+        expected_retry_ms = 0;
+    }
+    SECTION("an immediate reconnect backs off after service-unavailable responses") {
+        configured_retry_ms = 0;
+        unavailable_responses = 2;
+        expected_retry_ms = 2;
+    }
+    CAPTURE(retry_field, configured_retry_ms);
 
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
@@ -2086,6 +2122,8 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     coro::cancel_source connection_cancel;
     coro::cancel_source cleanup_cancel;
     sync::event release_server;
+    std::vector<int> reconnect_delays;
+    std::atomic<bool> final_request_received{false};
     std::atomic<bool> server_done{false};
     std::atomic<bool> client_done{false};
     struct observation {
@@ -2100,17 +2138,24 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
             co_return false;
         }
         const auto request = co_await read_request_headers(*first);
-        const std::string body = "retry: 0\ndata: initial\n\n";
+        const std::string body = retry_field + "data: initial\n\n";
         const bool sent = !request.empty() && co_await write_all(*first,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
             "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
         // Finite Content-Length ends the message without requiring TCP EOF.
-        auto second = co_await listener->accept(cleanup_cancel.get_token());
         bool requested = false;
-        if (second) {
-            requested = !(co_await read_request_headers(*second)).empty();
-            co_await release_server.wait();
-            co_await second->close();
+        for (size_t index = 0; index <= unavailable_responses; ++index) {
+            auto peer = co_await listener->accept(cleanup_cancel.get_token());
+            if (!peer || (co_await read_request_headers(*peer)).empty()) break;
+            reconnect_delays.push_back(http::detail::sse_reconnect_wait_ms_for_test.load());
+            if (index < unavailable_responses) {
+                if (!(co_await write_all(*peer, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"))) break;
+            } else {
+                requested = true;
+                final_request_received.store(true);
+                co_await release_server.wait();
+            }
+            co_await peer->close();
         }
         co_await first->close();
         server_done.store(true);
@@ -2119,8 +2164,8 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     auto client_root = sched.go_joinable([&]() -> coro::task<observation> {
         observation result;
         client_config config;
-        config.default_retry_ms = 1;
-        config.max_reconnect_attempts = 1;
+        config.default_retry_ms = configured_retry_ms;
+        config.max_reconnect_attempts = 1 + unavailable_responses;
         sse_client client(config);
         result.connected = co_await client.connect(
             "http://127.0.0.1:" + std::to_string(port) + "/events",
@@ -2138,8 +2183,8 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
         client_done.store(true);
         co_return result;
     });
-    const bool staged = wait_for([] {
-        return http::detail::client_response_read_staged_for_test.load();
+    const bool staged = wait_for([&] {
+        return final_request_received.load() && http::detail::client_response_read_staged_for_test.load();
     });
     receive_cancel.cancel();
     const bool returned = wait_for([&] { return client_done.load(); });
@@ -2166,6 +2211,11 @@ TEST_CASE("sse_client receive token cancels a staged reconnect header read",
     REQUIRE(client.value->connected);
     REQUIRE(client.value->first_event);
     REQUIRE(client.value->cancelled);
+    REQUIRE(http::detail::sse_reconnect_wait_ms_for_test.load() == expected_retry_ms);
+    if (unavailable_responses) {
+        const std::vector<int> expected{0, 1, 2};
+        REQUIRE(reconnect_delays == expected);
+    }
 }
 #endif
 

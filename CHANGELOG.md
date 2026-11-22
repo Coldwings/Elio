@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `io::read_dir()` reports enumeration errors rather than returning a partial
   directory listing as success (#1306).
 
+- SSE clients honor `default_retry_ms` when reconnecting without a
+  server-advertised retry interval. A nonpositive default reconnects immediately
+  on the first attempt and backs off after failures (#1308).
+
 ### Added
 
 - Move-only worker lifetime leases for external thread-affine owners. Lease

@@ -21,6 +21,7 @@
 #include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <cerrno>
@@ -28,6 +29,13 @@
 #include <optional>
 #include <vector>
 #include <functional>
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+#include <atomic>
+namespace elio::http::detail {
+inline std::atomic<int> sse_reconnect_wait_ms_for_test{-1};
+}
+#endif
 
 namespace elio::http::sse {
 
@@ -144,8 +152,11 @@ public:
     /// Get last event ID
     std::string_view last_event_id() const { return last_event_id_; }
     
-    /// Get current retry interval
-    int retry_ms() const { return retry_ms_; }
+    /// Get the server retry interval, or the standalone parser's 3 s default.
+    int retry_ms() const { return advertised_retry_ms_.value_or(3000); }
+
+    /// Last valid server retry field; an explicit zero is distinct from no field.
+    std::optional<int> advertised_retry_ms() const noexcept { return advertised_retry_ms_; }
     
     /// Reset parser state
     void reset() {
@@ -156,7 +167,7 @@ public:
         failed_ = false;
         error_message_.clear();
         skip_lf_after_terminal_cr_ = false;
-        // Don't reset last_event_id_ or retry_ms_ - these persist
+        // Keep the last event ID and server retry interval across reconnects.
     }
     
 private:
@@ -293,7 +304,7 @@ private:
                     }
                 }
                 if (valid && !value.empty()) {
-                    retry_ms_ = static_cast<int>(retry);
+                    advertised_retry_ms_ = static_cast<int>(retry);
                 }
             }
             // Ignore unknown fields
@@ -330,7 +341,7 @@ private:
     bool current_event_has_id_ = false;
     std::vector<event> events_;
     std::string last_event_id_;
-    int retry_ms_ = 3000;
+    std::optional<int> advertised_retry_ms_;
     size_t max_buffer_size_ = default_max_buffer_size;
     bool failed_ = false;
     bool skip_lf_after_terminal_cr_ = false;
@@ -724,9 +735,9 @@ private:
         // exponential backoff survives across reconnection cycles (flapping).
         int retry_ms = current_retry_ms_;
         if (retry_ms <= 0) {
-            retry_ms = parser_.retry_ms();
+            retry_ms = parser_.advertised_retry_ms().value_or(0);
             if (retry_ms <= 0) {
-                retry_ms = config_.default_retry_ms;
+                retry_ms = std::max(0, config_.default_retry_ms);
             }
             current_retry_ms_ = retry_ms;
         }
@@ -748,6 +759,13 @@ private:
             }
             
             ELIO_LOG_DEBUG("SSE reconnecting (attempt {}) in {}ms...", attempts, retry_ms);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            // A previous reconnect may already have staged its own header read.
+            if (http::detail::observe_client_response_read_entry_for_test.load()) {
+                http::detail::client_response_read_staged_for_test.store(false);
+            }
+            http::detail::sse_reconnect_wait_ms_for_test.store(retry_ms);
+#endif
             
             // Wait before reconnecting (cancellable)
             auto result = co_await elio::time::sleep_for(
@@ -769,10 +787,9 @@ private:
             
             state_ = client_state::reconnecting;
             
-            // Increase retry interval (exponential backoff, max 1 minute)
-            // Cap before multiplying to prevent signed integer overflow (UB).
-            current_retry_ms_ = std::min(current_retry_ms_, 30000) * 2;
-            current_retry_ms_ = std::min(current_retry_ms_, 60000);
+            // An immediate first attempt still backs off if it fails.
+            // Cap before doubling so large advertised intervals cannot overflow.
+            current_retry_ms_ = std::max(1, std::min(retry_ms, 30000) * 2);
             retry_ms = current_retry_ms_;
         }
         
